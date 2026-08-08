@@ -22,6 +22,14 @@ type frame struct {
 	ch    byte  // KindCodeBlock: fence character.
 	loose bool  // KindList: an item followed a blank line.
 	blank bool  // KindList, KindItem: the last line inside it was blank.
+
+	// An indented block's blank lines are content only when more indented lines
+	// follow, which is not known until they do. blankAt and blankEnd bracket a
+	// run held back pending that answer; see [Parser.indentedLine].
+	blankAt  Pos
+	blankEnd Pos
+	holding  bool // A run is held and its fate still unknown.
+	replay   bool // The run proved interior and is being re-read as content.
 }
 
 // mark is a cursor position that a probe can return to. [Lexer.Seek] alone
@@ -197,8 +205,7 @@ func (p *Parser) parseLine() {
 	codeStart, blank := p.scanIndent(base)
 
 	if inCode { // Indented code, which ends as soon as the indent does.
-		if !blank && codeStart >= 0 {
-			p.rawLine(codeStart)
+		if p.indentedLine(top, lineStart, codeStart, blank) {
 			return
 		}
 		p.closeTo(top, p.contentEnd)
@@ -355,13 +362,19 @@ func (p *Parser) continuesParagraph(matched int) bool {
 // that do not are the ones whose prefix the line already failed to carry.
 func (p *Parser) blankLine(matched int) {
 	p.closeTo(matched, p.contentEnd)
+	p.markBlank()
+	p.l.SkipLine()
+}
+
+// markBlank records the blank line against every enclosing list, whose
+// looseness the next item decides.
+func (p *Parser) markBlank() {
 	for i := range p.stack {
 		switch p.stack[i].node.Kind {
 		case KindList, KindItem:
 			p.stack[i].blank = true
 		}
 	}
-	p.l.SkipLine()
 }
 
 // --- containers ---
@@ -448,6 +461,59 @@ func (p *Parser) openIndentedCode(matched int, lineStart, codeStart Pos, base in
 		return
 	}
 	p.rawLine(codeStart)
+}
+
+// indentedLine handles one line of an open indented code block, reporting
+// whether the block survives it.
+//
+// A blank line is content when more indented lines follow and trailing padding
+// when they do not, and nothing on the line itself says which. So a blank run is
+// consumed but held: if the block then continues, the cursor goes back to where
+// the run began and re-reads it as content; if the block ends, the run is
+// dropped, having never been emitted. Holding costs two offsets rather than a
+// node per line, so an arbitrarily long run still fits in the frame, and the
+// re-read is over bytes the window is likely to still hold.
+func (p *Parser) indentedLine(i int, lineStart, codeStart Pos, blank bool) bool {
+	f := &p.stack[i]
+	if f.replay && lineStart >= f.blankEnd {
+		f.replay = false // The held run is behind the cursor again.
+	}
+	switch {
+	case blank && f.replay:
+		// Whatever is left after the indent, which for a blank line is its
+		// ending alone.
+		start := codeStart
+		if start < 0 {
+			start = p.l.Pos()
+		}
+		p.rawLine(start)
+		return true
+
+	case blank:
+		if !f.holding {
+			f.blankAt, f.holding = lineStart, true
+		}
+		p.markBlank() // Looseness still counts these, emitted or not.
+		p.l.SkipLine()
+		f.blankEnd = p.l.Pos()
+		return true
+
+	case codeStart >= 0 && f.holding:
+		// Indented content followed, so the run was interior after all. A blank
+		// run starts at a line start, where the column is 0, so Seek restores
+		// the cursor exactly.
+		f.holding, f.replay = false, true
+		p.err = p.l.Seek(f.blankAt)
+		return true
+
+	case codeStart >= 0:
+		p.rawLine(codeStart)
+		return true
+	}
+	// The block ends here, so a held run was trailing padding. Dropping it needs
+	// nothing done: it was never emitted, and never advanced contentEnd, so the
+	// close still lands on the last real byte.
+	return false
 }
 
 // fencedLine handles one line of an open fenced block: either the fence that

@@ -562,18 +562,68 @@ var parseEdgeTests = []struct {
 		`blockquote close 0..10 "> a\n> \n> b"`,
 		`document close 0..11 "> a\n> \n> b\n"`,
 	}},
-	// CommonMark keeps one code block holding "a\n\nb" here. Splitting it needs
-	// the blank lines held back until the next indented line proves they were
-	// interior, which is state this layer does not carry.
-	{"blank line splits indented code (divergence)", "    a\n\n    b\n", []string{
+	// A blank line between indented lines is interior content, so it belongs to
+	// one code block rather than splitting it into two.
+	{"blank line inside indented code", "    a\n\n    b\n", []string{
+		`document open 0..0 ""`,
+		`codeblock open 0..4 "    "`,
+		`raw 4..6 "a\n"`,
+		`raw 6..7 "\n"`,
+		`raw 11..13 "b\n"`,
+		`codeblock close 0..12 "    a\n\n    b"`,
+		`document close 0..13 "    a\n\n    b\n"`,
+	}},
+	// An interior blank line still has its indent stripped, so it contributes
+	// only its line ending.
+	{"blank line with spaces inside indented code", "    a\n  \n    b\n", []string{
+		`document open 0..0 ""`,
+		`codeblock open 0..4 "    "`,
+		`raw 4..6 "a\n"`,
+		`raw 8..9 "\n"`,
+		`raw 13..15 "b\n"`,
+		`codeblock close 0..14 "    a\n  \n    b"`,
+		`document close 0..15 "    a\n  \n    b\n"`,
+	}},
+	// Trailing blank lines are not content, so they are dropped and the block
+	// closes at its last real byte.
+	{"trailing blank after indented code", "    a\n\n", []string{
 		`document open 0..0 ""`,
 		`codeblock open 0..4 "    "`,
 		`raw 4..6 "a\n"`,
 		`codeblock close 0..5 "    a"`,
-		`codeblock open 7..11 "    "`,
+		`document close 0..7 "    a\n\n"`,
+	}},
+	{"indented code ended by a paragraph", "    a\n\nb\n", []string{
+		`document open 0..0 ""`,
+		`codeblock open 0..4 "    "`,
+		`raw 4..6 "a\n"`,
+		`codeblock close 0..5 "    a"`,
+		`paragraph open 7..7 ""`,
+		`text 7..8 "b"`,
+		`paragraph close 7..8 "b"`,
+		`document close 0..9 "    a\n\nb\n"`,
+	}},
+	// An interior run and a trailing run in the same block: the first is content,
+	// the second is dropped.
+	{"interior then trailing blanks", "    a\n\n    b\n\n", []string{
+		`document open 0..0 ""`,
+		`codeblock open 0..4 "    "`,
+		`raw 4..6 "a\n"`,
+		`raw 6..7 "\n"`,
 		`raw 11..13 "b\n"`,
-		`codeblock close 7..12 "    b"`,
-		`document close 0..13 "    a\n\n    b\n"`,
+		`codeblock close 0..12 "    a\n\n    b"`,
+		`document close 0..14 "    a\n\n    b\n\n"`,
+	}},
+	{"many blank lines inside indented code", "    a\n\n\n\n    b\n", []string{
+		`document open 0..0 ""`,
+		`codeblock open 0..4 "    "`,
+		`raw 4..6 "a\n"`,
+		`raw 6..7 "\n"`,
+		`raw 7..8 "\n"`,
+		`raw 8..9 "\n"`,
+		`raw 13..15 "b\n"`,
+		`codeblock close 0..14 "    a\n\n\n\n    b"`,
+		`document close 0..15 "    a\n\n\n\n    b\n"`,
 	}},
 	{"tab indents code", "\tcode\n", []string{
 		`document open 0..0 ""`,
