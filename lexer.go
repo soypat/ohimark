@@ -2,6 +2,7 @@ package ohimark
 
 import (
 	"io"
+	"unicode/utf8"
 
 	"github.com/soypat/lexorg"
 )
@@ -95,9 +96,19 @@ func (l *Lexer) Seek(p Pos) error {
 	if p < 0 {
 		return errNegativeOff
 	}
-	l.w.Reset(l.w.ReaderAt(), nil, int64(p))
-	l.reposition(int64(p))
+	l.rewind(int64(p), 0, 0)
 	return l.Err()
+}
+
+// rewind is Seek carrying the column and previous rune back with it, for a scan
+// that gave up and must retokenize bytes it already walked.
+func (l *Lexer) rewind(off int64, col int32, prev rune) {
+	// Resetting to the bound reader keeps the resident bytes, so a rewind inside
+	// them costs no read. It also clears the window's recorded EOF, which is
+	// what lets the cursor move back over the end of the file.
+	l.w.Reset(l.w.ReaderAt(), nil, off)
+	l.reposition(off)
+	l.col, l.prev = col, prev
 }
 
 // reposition drops the peek buffer and refills from off.
@@ -111,13 +122,48 @@ func (l *Lexer) reposition(off int64) {
 }
 
 // Next returns the next token and its span. Spans tile the source exactly: no
-// gaps, no overlaps. TokEOF at end of input, TokIllegal on a read failure.
-//
-// TODO: implement. Dispatch on peek[0]: leading digit to readDigits, rune
-// special to nothing to readWord, else the single-rune and run cases. Save
-// tokPrev before consuming.
+// gaps, no overlaps. TokEOF at end of input, TokIllegal on a read failure; both
+// have an empty span at the cursor.
 func (l *Lexer) Next() (tok Token, start, end Pos) {
-	panic("ohimark: todo")
+	// Captured before consuming: by the time this returns, prev has walked to the
+	// token's last rune, which is not what the flanking rules ask about.
+	l.tokPrev = l.prev
+	start = Pos(l.pos)
+	if l.n == 0 {
+		if l.Err() != nil {
+			return TokIllegal, start, start
+		}
+		return TokEOF, start, start
+	}
+	r := l.peek[0]
+	switch {
+	case isDigitRune(r):
+		return TokDigits, start, l.readDigits()
+	case isWordRune(r):
+		return TokWord, start, l.readWord()
+	}
+	switch tok = tokOf[byte(r)]; tok {
+	case TokSpace:
+		return tok, start, l.readSpace()
+	case TokNewline:
+		return tok, start, l.readNewline()
+	case TokEscape:
+		if end, ok := l.readEscape(); ok {
+			return tok, start, end
+		}
+	case TokEntity:
+		if end, ok := l.readEntity(); ok {
+			return tok, start, end
+		}
+	case TokPlus, TokBang, TokLT, TokBracketL, TokBracketR, TokParenL, TokParenR, TokDot:
+		l.advance()
+		return tok, start, Pos(l.pos)
+	default:
+		return tok, start, l.readRun(r)
+	}
+	// A backslash or ampersand that began no construct is ordinary text, and
+	// readWord takes the first rune whatever it is.
+	return TokWord, start, l.readWord()
 }
 
 // Err returns the lexer error, or nil if the input merely ended.
@@ -213,48 +259,119 @@ func (l *Lexer) peekIs(i int, r rune) bool { return l.PeekAt(i) == r }
 // SkipLine advances past the current line ending and returns the next line's
 // first offset, or EOF. Lets the parser jump a fenced body without tokenizing
 // bytes that are verbatim by definition.
-//
-// TODO: implement.
-func (l *Lexer) SkipLine() Pos { panic("ohimark: todo") }
+func (l *Lexer) SkipLine() Pos {
+	for l.n > 0 {
+		r := l.peek[0]
+		l.advance()
+		if r == '\n' {
+			break
+		}
+		if r == '\r' {
+			if l.peekIs(0, '\n') {
+				l.advance()
+			}
+			break
+		}
+	}
+	return Pos(l.pos)
+}
 
 // readRun consumes a maximal run of r, returning the offset past it.
-//
-// TODO: implement.
-func (l *Lexer) readRun(r rune) Pos { panic("ohimark: todo") }
+func (l *Lexer) readRun(r rune) Pos {
+	for l.n > 0 && l.peek[0] == r {
+		l.advance()
+	}
+	return Pos(l.pos)
+}
 
 // readWord consumes a maximal run of runes special to nothing. Digits are not
-// special, so a word in progress absorbs them.
-//
-// TODO: implement.
-func (l *Lexer) readWord() Pos { panic("ohimark: todo") }
+// special, so a word in progress absorbs them. The first rune goes in
+// unconditionally: [Lexer.Next] also lands here for a backslash or ampersand
+// that began no construct.
+func (l *Lexer) readWord() Pos {
+	l.advance()
+	for l.n > 0 && isWordRune(l.peek[0]) {
+		l.advance()
+	}
+	return Pos(l.pos)
+}
 
 // readDigits consumes a maximal run of '0'..'9'.
-//
-// TODO: implement.
-func (l *Lexer) readDigits() Pos { panic("ohimark: todo") }
+func (l *Lexer) readDigits() Pos {
+	for l.n > 0 && isDigitRune(l.peek[0]) {
+		l.advance()
+	}
+	return Pos(l.pos)
+}
 
-// readSpace consumes a maximal run of spaces and tabs.
-//
-// TODO: implement.
-func (l *Lexer) readSpace() Pos { panic("ohimark: todo") }
+// readSpace consumes a maximal run of whitespace that does not end a line.
+func (l *Lexer) readSpace() Pos {
+	for l.n > 0 && l.peek[0] < utf8.RuneSelf && tokOf[byte(l.peek[0])] == TokSpace {
+		l.advance()
+	}
+	return Pos(l.pos)
+}
 
 // readNewline consumes one line ending; "\r\n" counts as one.
-//
-// TODO: implement.
-func (l *Lexer) readNewline() Pos { panic("ohimark: todo") }
+func (l *Lexer) readNewline() Pos {
+	cr := l.peek[0] == '\r'
+	l.advance()
+	if cr && l.peekIs(0, '\n') {
+		l.advance()
+	}
+	return Pos(l.pos)
+}
 
 // readEscape consumes a backslash plus one ASCII punctuation rune. False for a
 // backslash before anything else, which is literal text.
-//
-// TODO: implement.
-func (l *Lexer) readEscape() (end Pos, ok bool) { panic("ohimark: todo") }
+func (l *Lexer) readEscape() (end Pos, ok bool) {
+	r := l.PeekAt(1)
+	if r >= utf8.RuneSelf || !isASCIIPunct(byte(r)) {
+		return Pos(l.pos), false
+	}
+	l.advance()
+	l.advance()
+	return Pos(l.pos), true
+}
+
+// maxEntityName bounds a named entity: "CounterClockwiseContourIntegral" is the
+// longest CommonMark knows, at 31 bytes.
+const maxEntityName = 31
 
 // readEntity consumes "&name;", "&#dd;" or "&#xhh;". An entity outruns the peek
-// buffer, so this marks the offset, consumes under a length bound, and Seeks
-// back on failure — free, since those bytes are still resident.
-//
-// TODO: implement.
-func (l *Lexer) readEntity() (end Pos, ok bool) { panic("ohimark: todo") }
+// buffer, so this consumes under a length bound and rewinds on failure — free,
+// since those bytes are still resident.
+func (l *Lexer) readEntity() (end Pos, ok bool) {
+	mark, col, prev := l.pos, l.col, l.prev
+	if l.readEntityBody() {
+		return Pos(l.pos), true
+	}
+	l.rewind(mark, col, prev)
+	return Pos(mark), false
+}
+
+func (l *Lexer) readEntityBody() bool {
+	l.advance() // '&'
+	digit, max := isAlnumRune, maxEntityName
+	if l.peekIs(0, '#') {
+		l.advance()
+		digit, max = isDigitRune, 7
+		if l.peekIs(0, 'x') || l.peekIs(0, 'X') {
+			l.advance()
+			digit, max = isHexRune, 6
+		}
+	}
+	n := 0
+	for n < max && l.n > 0 && digit(l.peek[0]) {
+		l.advance()
+		n++
+	}
+	if n == 0 || !l.peekIs(0, ';') {
+		return false
+	}
+	l.advance()
+	return true
+}
 
 // errAt latches a *SyntaxError; the first error wins.
 func (l *Lexer) errAt(pos Pos, msg string) {

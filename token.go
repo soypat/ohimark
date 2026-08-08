@@ -1,6 +1,6 @@
 package ohimark
 
-//go:generate go tool stringer -linecomment -type=Token -output=stringers_token.go
+//go:generate stringer -linecomment -type=Token,Kind -output=stringers.go
 
 // Token is a lexical token of markdown syntax. Tokens carry no structural
 // meaning: TokHash is a run of '#' whether or not it heads a heading.

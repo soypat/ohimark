@@ -7,6 +7,38 @@ import (
 	"github.com/soypat/lexorg"
 )
 
+// Node is one AST event: a construct's kind and the byte span it covers.
+// Dereference Start and End with the io.ReaderAt passed to [Parser.Reset].
+//
+// A node's meaning is always a pure function of its span. Text splits at every
+// escape and entity, so no node needs a value assembled in a buffer: "\*" is a
+// KindEscape span rendered by skipping its first byte.
+//
+// An open node's span covers its marker ("## ", "> ", "```go\n"); the matching
+// close node's covers the whole construct. A leaf's covers the leaf.
+type Node struct {
+	Kind  Kind
+	Flags Flags
+	_     [2]byte
+	// Attr is kind-specific:
+	//
+	//	KindHeading    level, 1..6
+	//	KindList       start number if FlagOrdered, else bullet byte
+	//	KindItem       ordinal within the list, 0-based
+	//	KindCodeBlock  fence run length if FlagFenced
+	//	KindEmph, KindStrong, KindCodeSpan   delimiter byte
+	//	otherwise      0
+	Attr  int32
+	Start Pos
+	End   Pos
+}
+
+func (n Node) IsOpen() bool   { return n.Flags&FlagOpen != 0 }
+func (n Node) IsClosed() bool { return n.Flags&FlagClose != 0 }
+
+// Len returns the byte length of the node's span.
+func (n Node) Len() int64 { return int64(n.End - n.Start) }
+
 // Pos is an absolute byte offset into the markdown source.
 type Pos int64
 
@@ -27,8 +59,6 @@ func (pos Pos) AppendString(dst []byte) []byte {
 func (pos Pos) ToLineCol(r io.ReaderAt, aux []byte) (line, col, lineLength int, err error) {
 	return lexorg.ToLineCol(r, int64(pos), aux)
 }
-
-//go:generate go tool stringer -linecomment -type=Kind -output=stringers_kind.go
 
 // Kind is the type of markdown construct a [Node] describes.
 type Kind uint8
@@ -107,35 +137,3 @@ const (
 	FlagLoose   // KindList close: an item was blank-line separated.
 	FlagFenced  // KindCodeBlock: ``` rather than a 4-space indent.
 )
-
-// Node is one AST event: a construct's kind and the byte span it covers.
-// Dereference Start and End with the io.ReaderAt passed to [Parser.Reset].
-//
-// A node's meaning is always a pure function of its span. Text splits at every
-// escape and entity, so no node needs a value assembled in a buffer: "\*" is a
-// KindEscape span rendered by skipping its first byte.
-//
-// An open node's span covers its marker ("## ", "> ", "```go\n"); the matching
-// close node's covers the whole construct. A leaf's covers the leaf.
-type Node struct {
-	Kind  Kind
-	Flags Flags
-	_     [2]byte
-	// Attr is kind-specific:
-	//
-	//	KindHeading    level, 1..6
-	//	KindList       start number if FlagOrdered, else bullet byte
-	//	KindItem       ordinal within the list, 0-based
-	//	KindCodeBlock  fence run length if FlagFenced
-	//	KindEmph, KindStrong, KindCodeSpan   delimiter byte
-	//	otherwise      0
-	Attr  int32
-	Start Pos
-	End   Pos
-}
-
-func (n Node) IsOpen() bool  { return n.Flags&FlagOpen != 0 }
-func (n Node) IsClose() bool { return n.Flags&FlagClose != 0 }
-
-// Len returns the byte length of the node's span.
-func (n Node) Len() int64 { return int64(n.End - n.Start) }
