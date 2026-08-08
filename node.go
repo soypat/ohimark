@@ -33,8 +33,8 @@ type Node struct {
 	End   Pos
 }
 
-func (n Node) IsOpen() bool   { return n.Flags&FlagOpen != 0 }
-func (n Node) IsClosed() bool { return n.Flags&FlagClose != 0 }
+func (n Node) IsOpen() bool  { return n.Flags&FlagOpen != 0 }
+func (n Node) IsClose() bool { return n.Flags&FlagClose != 0 }
 
 // Len returns the byte length of the node's span.
 func (n Node) Len() int64 { return int64(n.End - n.Start) }

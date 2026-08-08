@@ -19,7 +19,7 @@ func writeNode(sb *strings.Builder, src string, n Node) {
 	switch {
 	case n.IsOpen():
 		sb.WriteString(" open")
-	case n.IsClosed():
+	case n.IsClose():
 		sb.WriteString(" close")
 	}
 	fmt.Fprintf(sb, " %d..%d %q", n.Start, n.End, src[n.Start:n.End])
@@ -61,10 +61,10 @@ func dumpNodes(t *testing.T, src string, bufSize int) string {
 		if n.Start < 0 || n.End > Pos(len(src)) || n.Start > n.End {
 			t.Fatalf("node %d (%s) has span %v..%v outside 0..%d", i, n.Kind, n.Start, n.End, len(src))
 		}
-		if n.IsOpen() && n.IsClosed() {
+		if n.IsOpen() && n.IsClose() {
 			t.Fatalf("node %d (%s) is both open and close", i, n.Kind)
 		}
-		if n.Kind.IsLeaf() && (n.IsOpen() || n.IsClosed()) {
+		if n.Kind.IsLeaf() && (n.IsOpen() || n.IsClose()) {
 			t.Fatalf("leaf node %d (%s) carries an open/close flag", i, n.Kind)
 		}
 		// A list holds items and nothing else; everything else holds no items.
@@ -76,7 +76,7 @@ func dumpNodes(t *testing.T, src string, bufSize int) string {
 		switch {
 		case n.IsOpen():
 			open = append(open, n)
-		case n.IsClosed():
+		case n.IsClose():
 			if len(open) == 0 {
 				t.Fatalf("node %d: %s close with nothing open", i, n.Kind)
 			}
@@ -1020,7 +1020,7 @@ func FuzzParserBalance(f *testing.F) {
 			switch {
 			case n.IsOpen():
 				open = append(open, n)
-			case n.IsClosed():
+			case n.IsClose():
 				if len(open) == 0 {
 					t.Fatalf("%s close with nothing open over %q", n.Kind, src)
 				}

@@ -94,15 +94,15 @@ func TestNodeSpan(t *testing.T) {
 	if n.Len() != 7 {
 		t.Errorf("Len = %d, want 7", n.Len())
 	}
-	if n.IsOpen() || n.IsClosed() {
+	if n.IsOpen() || n.IsClose() {
 		t.Error("a bare node should be neither open nor closed")
 	}
 	n.Flags = FlagOpen
-	if !n.IsOpen() || n.IsClosed() {
+	if !n.IsOpen() || n.IsClose() {
 		t.Error("FlagOpen should read as open only")
 	}
 	n.Flags = FlagClose
-	if n.IsOpen() || !n.IsClosed() {
+	if n.IsOpen() || !n.IsClose() {
 		t.Error("FlagClose should read as closed only")
 	}
 }

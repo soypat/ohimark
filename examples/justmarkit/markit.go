@@ -51,11 +51,27 @@ func run(flags Flags) (err error) {
 	if err != nil {
 		return err
 	}
+	oc := []string{"open", "close"}
+	var totlen int64
 	for {
 		node, err := parser.Next()
 		if err != nil {
 			return err
 		}
-		fmt.Println(node.Kind.String(), node.Len())
+		n := node.Len()
+		totlen += n
+		fmt.Println(node.Kind.String(), oc[b2i(node.IsClose())], "len:", n)
+		if node.Kind == ohimark.KindDocument && node.IsClose() {
+			break
+		}
 	}
+	// fmt.Println("total length:", totlen)
+	return nil
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
