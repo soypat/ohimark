@@ -5,59 +5,76 @@ import "io"
 const (
 	defaultMaxDepth  = 64
 	defaultMaxDelims = 1024
+
+	maxATXLevel    = 6 // Hashes past this are text, not a heading.
+	maxBlockIndent = 3 // Indent past which a line is code, not a block marker.
+	codeIndent     = 4 // Columns of indent that make a line indented code.
 )
 
-// tokspan is one token with its span, as the parser buffers it.
-type tokspan struct {
-	tok        Token
-	start, end Pos
+// frame is one open block: the node emitted when it opened plus whatever its
+// continuation rule needs. Leaf blocks share the stack with containers — only
+// the innermost block can be a leaf, so closing order is unaffected.
+type frame struct {
+	node  Node
+	col   int32 // KindItem, KindCodeBlock: the column its content starts at.
+	fence int32 // KindCodeBlock: opening fence run length; 0 when indented.
+	count int32 // KindList: items opened so far, which is the next ordinal.
+	ch    byte  // KindCodeBlock: fence character.
+	loose bool  // KindList: an item followed a blank line.
+	blank bool  // KindList, KindItem: the last line inside it was blank.
 }
 
-// Parser turns a token stream into markdown AST events. Containers arrive as an
-// open node and later a close node; the nodes between are their content. The
-// parser holds no document text: every [Node] is a span the caller reads back
-// through the io.ReaderAt it supplied.
+// mark is a cursor position that a probe can return to. [Lexer.Seek] alone
+// cannot: the column is unrecoverable without rescanning from the line start,
+// and the block rules are all stated in columns.
+type mark struct {
+	pos  int64
+	col  int32
+	prev rune
+}
+
+// Parser turns markdown into AST events. Containers arrive as an open node and
+// later a close node; the nodes between are their content. The parser holds no
+// document text: every [Node] is a span the caller reads back through the
+// io.ReaderAt it supplied.
 //
 // Memory is bounded by three things: the window buffer, MaxDepth nestings, and
 // MaxInlineDelims delimiter runs per leaf block. Nothing else grows with input.
+//
+// The block layer reads the [Lexer]'s rune cursor rather than its tokens.
+// Container prefixes are defined in columns, and a single space token may span
+// a container boundary — "  " belonging half to an item's indent and half to
+// its content — which no token stream can split. Tokens serve the inline layer,
+// which runs inside one leaf block's span where columns no longer matter.
 //
 // Parser embeds its Lexer by value, so the ordinary caller builds one object and
 // runs one Next loop. Callers wanting raw tokens use a [Lexer] directly.
 type Parser struct {
 	l Lexer
 
-	// tok is current, peek the lookahead. Two is the deepest case: TokDigits
-	// then TokDot for an ordered marker, TokBracketR then TokParenL for a link.
-	tok   tokspan
-	peek  [2]tokspan
-	npeek int8
+	// stack is the open-block spine, outermost first. stack[0] is the document.
+	stack []frame
 
-	// stack is the open-container spine, outermost first. Each entry is the node
-	// emitted when the container opened; popping it produces the close.
-	stack []Node
+	// pending holds the nodes one line produced, drained before the next line is
+	// read. A line queues at most one close and one open per open block, plus a
+	// leaf and its attribute, so Reset sizes this from MaxDepth.
+	pending []Node
+	ipend   int
+
+	// contentEnd is the offset past the last byte that counts as content, which
+	// is where a close node lands. It trails the cursor: a close is queued
+	// before the current line's content is read.
+	contentEnd Pos
+
+	started bool
+	done    bool
+	err     error
 
 	// delims memoizes the current leaf block's runs, escapes, entities and
 	// breaks. Cleared per block, capped by MaxInlineDelims.
 	delims []delim
 
-	// Emission cursor over delims during a leaf block's second pass.
-	emitIdx  int32
-	emitPos  Pos
-	inInline bool
-
-	// noMemo disables the memo after MaxInlineDelims was exceeded and the lexer
-	// was rewound to the block start. See inline.go.
-	noMemo bool
-
-	// pending holds nodes a single step produced together, drained before
-	// scanning resumes. KindLink open + KindDest + KindTitle is the deepest.
-	pending [4]Node
-	npend   int8
-	ipend   int8
-
-	err error
-
-	// MaxDepth caps container nesting. <=0 uses an internal default.
+	// MaxDepth caps block nesting. <=0 uses an internal default.
 	MaxDepth int
 	// MaxInlineDelims caps memoized delimiter runs per leaf block. Exceeding it
 	// is not an error: the parser rewinds to the block start and re-scans
@@ -66,30 +83,46 @@ type Parser struct {
 }
 
 // Reset points the parser at the start of r, reading through buf. Forwards to
-// [Lexer.Reset]; buf has the same constraints. Tuning fields and both internal
+// [Lexer.Reset]; buf has the same constraints. Tuning fields and the internal
 // slices survive across resets.
 func (p *Parser) Reset(source string, r io.ReaderAt, buf []byte) error {
+	p.stack = p.stack[:0]
+	p.delims = p.delims[:0]
+	p.pending, p.ipend = p.pending[:0], 0
+	p.contentEnd = 0
+	p.started, p.done = false, false
+	p.err = nil
+	if n := 2*p.maxDepth() + 8; cap(p.pending) < n {
+		p.pending = make([]Node, 0, n)
+	}
 	if err := p.l.Reset(source, r, 0, buf); err != nil {
 		return err
 	}
-	p.tok = tokspan{}
-	p.npeek = 0
-	p.stack = p.stack[:0]
-	p.delims = p.delims[:0]
-	p.emitIdx, p.emitPos, p.inInline = 0, 0, false
-	p.noMemo = false
-	p.npend, p.ipend = 0, 0
-	p.err = nil
 	return nil
 }
 
 // Next returns the next node. Returns io.EOF once, after the document's close
 // node, and the latched error on every call after a failure.
-//
-// TODO: implement. Drain p.pending, then either continue the current leaf
-// block's inline emission or run one step of the block loop.
 func (p *Parser) Next() (Node, error) {
-	panic("ohimark: todo")
+	if p.ipend < len(p.pending) {
+		n := p.pending[p.ipend]
+		p.ipend++
+		return n, nil
+	}
+	p.pending, p.ipend = p.pending[:0], 0
+	if err := p.Err(); err != nil {
+		return Node{}, err
+	}
+	for len(p.pending) == 0 {
+		if !p.step() {
+			if err := p.Err(); err != nil {
+				return Node{}, err
+			}
+			return Node{}, io.EOF
+		}
+	}
+	p.ipend = 1
+	return p.pending[0], nil
 }
 
 // Err returns the first error the parser or its lexer hit, or nil if the input
@@ -101,7 +134,7 @@ func (p *Parser) Err() error {
 	return p.l.Err()
 }
 
-// Depth returns how many containers are currently open.
+// Depth returns how many blocks are currently open, the document included.
 func (p *Parser) Depth() int { return len(p.stack) }
 
 // Lexer returns the embedded tokenizer. Advancing it out from under
@@ -122,79 +155,642 @@ func (p *Parser) maxDelims() int {
 	return defaultMaxDelims
 }
 
-// --- token cursor ---
-
-// next advances tok, drawing from the peek buffer before the lexer.
-//
-// TODO: implement.
-func (p *Parser) next() { panic("ohimark: todo") }
-
-// peekAt returns the i'th token after tok, filling as needed.
-//
-// TODO: implement.
-func (p *Parser) peekAt(i int) tokspan { panic("ohimark: todo") }
-
-// accept advances past tok and reports true when it is t.
-//
-// TODO: implement.
-func (p *Parser) accept(t Token) bool { panic("ohimark: todo") }
-
-// seek rewinds the lexer to at and discards the peek buffer.
-//
-// TODO: implement.
-func (p *Parser) seek(at Pos) { panic("ohimark: todo") }
+// step runs the machine far enough to queue at least one node, and reports
+// false once the document is finished.
+func (p *Parser) step() bool {
+	switch {
+	case p.err != nil:
+		return false
+	case !p.started:
+		p.started = true
+		return p.push(frame{node: Node{Kind: KindDocument}})
+	case p.done:
+		return false
+	case p.l.IsDone():
+		p.done = true
+		p.closeTo(0, p.contentEnd)
+		return true
+	}
+	p.parseLine()
+	return true
+}
 
 // --- block structure ---
 //
-// Three phases per line: match the continuations of open containers, open
-// whatever new blocks the line begins, attach the rest as leaf content.
+// Three phases per line: consume the prefixes of the blocks that continue, open
+// whatever the line begins, attach the rest as content.
 
-// matchOpen walks stack consuming each container's line prefix — TokGT for a
-// quote, TokSpace to an item's content column. Returns how many matched; every
-// container past that must close.
-//
-// TODO: implement.
-func (p *Parser) matchOpen() (matched int) { panic("ohimark: todo") }
+// parseLine consumes exactly one source line.
+func (p *Parser) parseLine() {
+	matched := p.matchOpen()
+	top := len(p.stack) - 1
+	inCode := matched == top && p.stack[top].node.Kind == KindCodeBlock
 
-// startBlocks opens every new container and leaf the line begins.
-//
-// TODO: implement.
-func (p *Parser) startBlocks() bool { panic("ohimark: todo") }
+	// A fenced block owns its lines whole: no indent scan, no marker probes.
+	if inCode && p.stack[top].fence > 0 {
+		p.fencedLine(top)
+		return
+	}
 
-// push opens a container, queueing its open node. Fails past MaxDepth.
-//
-// TODO: implement.
-func (p *Parser) push(n Node) bool { panic("ohimark: todo") }
+	lineStart := p.l.Pos()
+	base := int32(p.l.Col())
+	codeStart, blank := p.scanIndent(base)
 
-// pop closes the innermost container, spanning its first marker byte to end.
+	if inCode { // Indented code, which ends as soon as the indent does.
+		if !blank && codeStart >= 0 {
+			p.rawLine(codeStart)
+			return
+		}
+		p.closeTo(top, p.contentEnd)
+	}
+	if blank {
+		p.blankLine(matched)
+		return
+	}
+
+	// Containers can nest arbitrarily on one line: "> - a" opens three.
+	for {
+		if p.l.PeekRune() == '>' {
+			if !p.openQuote(matched) {
+				return
+			}
+			matched = len(p.stack)
+			lineStart = p.l.Pos()
+			base = int32(p.l.Col())
+			if codeStart, blank = p.scanIndent(base); blank {
+				p.blankLine(matched)
+				return
+			} else if codeStart >= 0 {
+				p.openIndentedCode(matched, lineStart, codeStart, base)
+				return
+			}
+			continue
+		}
+		// A run of "-", "_" or "*" alone on the line is a break, not a bullet.
+		if end, ok := p.atThematicBreak(); ok {
+			p.closeForSibling(matched)
+			p.queue(Node{Kind: KindThematicBreak, Start: lineStart, End: end})
+			p.contentEnd = end
+			p.l.SkipLine()
+			return
+		}
+		if marker, ch, ok := p.atBullet(); ok {
+			if !p.openItem(matched, marker, int32(ch), 0) {
+				return
+			}
+			matched = len(p.stack)
+			continue
+		}
+		if marker, num, ok := p.atOrdered(); ok {
+			if !p.openItem(matched, marker, num, FlagOrdered) {
+				return
+			}
+			matched = len(p.stack)
+			continue
+		}
+		break
+	}
+
+	if isLineEndRune(p.l.PeekRune()) {
+		// A marker ate the whole line: "-" alone opens an empty item, not an
+		// item holding an empty paragraph.
+		p.l.SkipLine()
+		return
+	}
+
+	// Indent inside a container opened on this line is code, not content.
+	if codeStart >= 0 && !p.continuesParagraph(matched) {
+		p.openIndentedCode(matched, lineStart, codeStart, base)
+		return
+	}
+	contentStart := p.l.Pos()
+	if marker, ok := p.atATX(); ok {
+		p.headingLine(matched, marker)
+		return
+	}
+	if f, info, trim, ok := p.atFence(); ok {
+		p.closeForSibling(matched)
+		f.col = base
+		if !p.push(f) {
+			return
+		}
+		if info.Kind != KindUndefined {
+			p.queue(info)
+		}
+		p.contentEnd = trim
+		return
+	}
+	if p.continuesParagraph(matched) {
+		p.paragraphText(contentStart)
+		return
+	}
+	p.closeForSibling(matched)
+	if !p.push(frame{node: Node{Kind: KindParagraph, Start: contentStart, End: contentStart}}) {
+		return
+	}
+	p.paragraphText(contentStart)
+}
+
+// matchOpen consumes the line prefix of every open block that continues on this
+// line and returns the stack depth reached. Every frame past it must close,
+// unless the line turns out to continue a paragraph.
+func (p *Parser) matchOpen() int {
+	i := 1 // Frame 0 is the document, which every line continues.
+	for ; i < len(p.stack); i++ {
+		switch f := &p.stack[i]; f.node.Kind {
+		case KindBlockQuote:
+			if !p.matchQuote() {
+				return i
+			}
+		case KindList:
+			// A list has no prefix of its own; its items carry one.
+		case KindItem:
+			if !p.matchItem(f.col) {
+				return i
+			}
+		default:
+			// A leaf, whose continuation depends on what the rest of the line
+			// turns out to be rather than on a prefix.
+			return i
+		}
+	}
+	return i
+}
+
+// matchQuote consumes "> " when the line carries it. Up to three spaces may
+// precede the marker, and one space after it belongs to the marker.
+func (p *Parser) matchQuote() bool {
+	i := 0
+	for i < maxBlockIndent && p.l.PeekAt(i) == ' ' {
+		i++
+	}
+	if p.l.PeekAt(i) != '>' {
+		return false
+	}
+	for range i + 1 {
+		p.l.advance()
+	}
+	if p.l.PeekRune() == ' ' {
+		p.l.advance()
+	}
+	return true
+}
+
+// matchItem consumes the indent that continues an item whose content starts at
+// col. A blank line does not interrupt an item; it only makes its list loose.
+func (p *Parser) matchItem(col int32) bool {
+	p.skipIndent(col)
+	return int32(p.l.Col()) >= col || p.atLineEnd()
+}
+
+// continuesParagraph reports whether a paragraph is open exactly at the matched
+// depth, so a line beginning no block simply adds to it.
+func (p *Parser) continuesParagraph(matched int) bool {
+	top := len(p.stack) - 1
+	return matched == top && p.stack[top].node.Kind == KindParagraph
+}
+
+// blankLine ends the open leaf and marks the enclosing lists, whose looseness
+// the next item decides. Containers themselves survive a blank line — those
+// that do not are the ones whose prefix the line already failed to carry.
+func (p *Parser) blankLine(matched int) {
+	p.closeTo(matched, p.contentEnd)
+	for i := range p.stack {
+		switch p.stack[i].node.Kind {
+		case KindList, KindItem:
+			p.stack[i].blank = true
+		}
+	}
+	p.l.SkipLine()
+}
+
+// --- containers ---
+
+func (p *Parser) openQuote(matched int) bool {
+	// A quote is the list's sibling, not its content: only an item indented to
+	// the item's content column would have matched as inside it.
+	p.closeForSibling(matched)
+	start := p.l.Pos()
+	p.l.advance() // '>'
+	if p.l.PeekRune() == ' ' {
+		p.l.advance()
+	}
+	return p.push(frame{node: Node{Kind: KindBlockQuote, Start: start, End: p.l.Pos()}})
+}
+
+// openItem opens an item, reusing the enclosing list when the marker matches it
+// and starting a fresh one otherwise. attr is the bullet byte, or the start
+// number when ordered.
+func (p *Parser) openItem(matched int, marker Node, attr int32, flags Flags) bool {
+	p.closeTo(matched, p.contentEnd)
+	top := len(p.stack) - 1
+	f := &p.stack[top]
+	same := f.node.Kind == KindList && f.node.Flags&FlagOrdered == flags&FlagOrdered &&
+		(flags&FlagOrdered != 0 || f.node.Attr == attr)
+	if !same {
+		// A different marker starts a different list.
+		for len(p.stack) > 1 && p.stack[len(p.stack)-1].node.Kind == KindList {
+			p.queue(p.pop(p.contentEnd))
+		}
+		list := marker
+		list.Kind = KindList
+		list.Flags = flags
+		list.Attr = attr
+		if !p.push(frame{node: list}) {
+			return false
+		}
+	}
+	f = &p.stack[len(p.stack)-1]
+	if f.blank {
+		f.loose = true
+	}
+	f.blank = false
+	item := marker
+	item.Kind = KindItem
+	item.Flags = 0
+	item.Attr = f.count
+	f.count++
+	return p.push(frame{node: item, col: int32(p.l.Col())})
+}
+
+// --- leaves ---
+
+// headingLine emits a whole ATX heading: it opens, holds one line, and closes.
+func (p *Parser) headingLine(matched int, marker Node) {
+	p.closeForSibling(matched)
+	if !p.push(frame{node: marker}) {
+		return
+	}
+	textEnd, lineEnd := p.readHeading(marker.End)
+	if textEnd > marker.End {
+		p.queue(Node{Kind: KindText, Start: marker.End, End: textEnd})
+	}
+	if lineEnd < marker.End {
+		lineEnd = marker.End
+	}
+	p.contentEnd = lineEnd
+	p.closeTo(len(p.stack)-1, lineEnd)
+	p.l.SkipLine()
+}
+
+func (p *Parser) paragraphText(start Pos) {
+	trim, _, _ := p.readLine()
+	if trim > start {
+		p.queue(Node{Kind: KindText, Start: start, End: trim})
+		p.contentEnd = trim
+	}
+}
+
+func (p *Parser) openIndentedCode(matched int, lineStart, codeStart Pos, base int32) {
+	p.closeForSibling(matched)
+	n := Node{Kind: KindCodeBlock, Start: lineStart, End: codeStart}
+	if !p.push(frame{node: n, col: base}) {
+		return
+	}
+	p.rawLine(codeStart)
+}
+
+// fencedLine handles one line of an open fenced block: either the fence that
+// closes it or a verbatim content line.
+func (p *Parser) fencedLine(i int) {
+	f := &p.stack[i]
+	if end, ok := p.atCloseFence(f.ch, f.fence); ok {
+		p.contentEnd = end
+		p.closeTo(i, end)
+		p.l.SkipLine()
+		return
+	}
+	p.rawLine(p.l.Pos())
+}
+
+// rawLine emits one line of verbatim content, line ending included.
+func (p *Parser) rawLine(start Pos) {
+	_, end, next := p.readLine()
+	if next > start {
+		p.queue(Node{Kind: KindRaw, Start: start, End: next})
+	}
+	if end > p.contentEnd {
+		p.contentEnd = end
+	}
+}
+
+// --- line-start probes ---
 //
-// TODO: implement.
-func (p *Parser) pop(end Pos) Node { panic("ohimark: todo") }
+// Each reports whether the construct starts here and, on a false result, leaves
+// the cursor where it found it. Probing consumes and rewinds rather than peeks:
+// a heading needs seven runes of lookahead and a thematic break needs the whole
+// line, both past the lexer's peek buffer, and a rewind inside the window costs
+// no read.
+
+// atThematicBreak matches three or more of "-", "_" or "*" alone on the line.
+func (p *Parser) atThematicBreak() (end Pos, ok bool) {
+	ch := p.l.PeekRune()
+	if ch != '-' && ch != '_' && ch != '*' {
+		return 0, false
+	}
+	m := p.mark()
+	n := 0
+	for {
+		switch r := p.l.PeekRune(); {
+		case r == ch:
+			n++
+			p.l.advance()
+			end = p.l.Pos()
+		case isIndentRune(r):
+			p.l.advance()
+		case isLineEndRune(r):
+			if n >= 3 {
+				return end, true
+			}
+			p.reset(m)
+			return 0, false
+		default:
+			p.reset(m)
+			return 0, false
+		}
+	}
+}
+
+// atATX matches one to six hashes followed by a space or the line's end.
+func (p *Parser) atATX() (marker Node, ok bool) {
+	if p.l.PeekRune() != '#' {
+		return Node{}, false
+	}
+	m := p.mark()
+	start := p.l.Pos()
+	n := int32(0)
+	for p.l.PeekRune() == '#' {
+		n++
+		p.l.advance()
+	}
+	r := p.l.PeekRune()
+	if n > maxATXLevel || !(isIndentRune(r) || isLineEndRune(r)) {
+		p.reset(m)
+		return Node{}, false
+	}
+	p.skipAll()
+	return Node{Kind: KindHeading, Attr: n, Start: start, End: p.l.Pos()}, true
+}
+
+// atBullet matches "-", "*" or "+" followed by a space or the line's end. The
+// caller must rule out a thematic break first.
+func (p *Parser) atBullet() (marker Node, ch byte, ok bool) {
+	r := p.l.PeekRune()
+	if r != '-' && r != '*' && r != '+' {
+		return Node{}, 0, false
+	}
+	if nx := p.l.PeekAt(1); !(isIndentRune(nx) || isLineEndRune(nx)) {
+		return Node{}, 0, false
+	}
+	start := p.l.Pos()
+	p.l.advance()
+	p.skipAll()
+	return Node{Start: start, End: p.l.Pos()}, byte(r), true
+}
+
+// atOrdered matches digits followed by "." or ")" and a space or the line's end.
+func (p *Parser) atOrdered() (marker Node, start int32, ok bool) {
+	if !isDigitRune(p.l.PeekRune()) {
+		return Node{}, 0, false
+	}
+	m := p.mark()
+	begin := p.l.Pos()
+	num, n := int32(0), 0
+	for isDigitRune(p.l.PeekRune()) && n < 9 {
+		num = num*10 + (p.l.PeekRune() - '0')
+		n++
+		p.l.advance()
+	}
+	if r := p.l.PeekRune(); r != '.' && r != ')' {
+		p.reset(m)
+		return Node{}, 0, false
+	}
+	p.l.advance()
+	if nx := p.l.PeekRune(); !(isIndentRune(nx) || isLineEndRune(nx)) {
+		p.reset(m)
+		return Node{}, 0, false
+	}
+	p.skipAll()
+	return Node{Start: begin, End: p.l.Pos()}, num, true
+}
+
+// atFence matches an opening code fence, consuming through the line ending: the
+// open node's span covers the whole opening line, so the body starts where it
+// ends. trim is that line's last content byte, where the block closes if the
+// fence is never terminated.
+func (p *Parser) atFence() (f frame, info Node, trim Pos, ok bool) {
+	ch := p.l.PeekRune()
+	if ch != '`' && ch != '~' {
+		return frame{}, Node{}, 0, false
+	}
+	m := p.mark()
+	start := p.l.Pos()
+	n := int32(0)
+	for p.l.PeekRune() == ch {
+		n++
+		p.l.advance()
+	}
+	if n < 3 {
+		p.reset(m)
+		return frame{}, Node{}, 0, false
+	}
+	p.skipAll()
+	infoStart := p.l.Pos()
+	infoEnd := infoStart
+	for {
+		r := p.l.PeekRune()
+		if isLineEndRune(r) {
+			break
+		}
+		if ch == '`' && r == '`' {
+			// A backtick fence's info string may hold no backtick, or "`a`" at
+			// the start of a line would open a block instead of a code span.
+			p.reset(m)
+			return frame{}, Node{}, 0, false
+		}
+		p.l.advance()
+		if !isIndentRune(r) {
+			infoEnd = p.l.Pos()
+		}
+	}
+	trim = infoEnd
+	if trim == infoStart {
+		trim = start + Pos(n)
+	}
+	node := Node{Kind: KindCodeBlock, Flags: FlagFenced, Attr: n, Start: start, End: p.l.SkipLine()}
+	if infoEnd > infoStart {
+		info = Node{Kind: KindInfo, Start: infoStart, End: infoEnd}
+	}
+	return frame{node: node, fence: n, ch: byte(ch)}, info, trim, true
+}
+
+// atCloseFence matches a fence of at least n of ch alone on the line.
+func (p *Parser) atCloseFence(ch byte, n int32) (end Pos, ok bool) {
+	m := p.mark()
+	for i := 0; i < maxBlockIndent && p.l.PeekRune() == ' '; i++ {
+		p.l.advance()
+	}
+	if p.l.PeekRune() != rune(ch) {
+		p.reset(m)
+		return 0, false
+	}
+	cnt := int32(0)
+	for p.l.PeekRune() == rune(ch) {
+		cnt++
+		p.l.advance()
+	}
+	end = p.l.Pos()
+	p.skipAll()
+	if cnt < n || !isLineEndRune(p.l.PeekRune()) {
+		p.reset(m)
+		return 0, false
+	}
+	return end, true
+}
+
+// --- cursor helpers ---
+
+func (p *Parser) mark() mark      { return mark{p.l.pos, p.l.col, p.l.prev} }
+func (p *Parser) reset(m mark)    { p.l.rewind(m.pos, m.col, m.prev) }
+func (p *Parser) atLineEnd() bool { p.skipAll(); return isLineEndRune(p.l.PeekRune()) }
+
+// skipAll consumes every space and tab at the cursor.
+func (p *Parser) skipAll() {
+	for isIndentRune(p.l.PeekRune()) {
+		p.l.advance()
+	}
+}
+
+// skipIndent consumes spaces and tabs while the cursor stays left of limit.
+func (p *Parser) skipIndent(limit int32) {
+	for int32(p.l.Col()) < limit && isIndentRune(p.l.PeekRune()) {
+		p.l.advance()
+	}
+}
+
+// scanIndent consumes the line's leading whitespace. codeStart is where an
+// indented code block's content would begin, or -1 when the line does not reach
+// codeIndent columns past base.
+func (p *Parser) scanIndent(base int32) (codeStart Pos, blank bool) {
+	p.skipIndent(base + codeIndent)
+	codeStart = p.l.Pos()
+	if int32(p.l.Col()) < base+codeIndent {
+		codeStart = -1
+	}
+	p.skipAll() // Whatever is left is content, unless the line is blank.
+	return codeStart, isLineEndRune(p.l.PeekRune())
+}
+
+// readLine consumes the rest of the line, reporting the offset past its last
+// non-whitespace byte, the offset past its last byte before the line ending,
+// and the offset the next line starts at.
+func (p *Parser) readLine() (trim, end, next Pos) {
+	trim = p.l.Pos()
+	for {
+		r := p.l.PeekRune()
+		if isLineEndRune(r) {
+			break
+		}
+		p.l.advance()
+		if !isIndentRune(r) {
+			trim = p.l.Pos()
+		}
+	}
+	end = p.l.Pos()
+	return trim, end, p.l.SkipLine()
+}
+
+// readHeading consumes an ATX heading's content, reporting where its text ends
+// and where the line does. They differ by a closing sequence: a trailing run of
+// hashes preceded by whitespace, which is part of the heading but not its text.
+func (p *Parser) readHeading(from Pos) (textEnd, lineEnd Pos) {
+	textEnd, lineEnd = from, from
+	hashEnd := Pos(-1) // Text end recorded when the trailing hash run began.
+	prevSpace := true  // A closing sequence must be preceded by whitespace.
+	for {
+		r := p.l.PeekRune()
+		if isLineEndRune(r) {
+			break
+		}
+		switch {
+		case r == '#':
+			if hashEnd < 0 && prevSpace {
+				hashEnd = textEnd
+			}
+			prevSpace = false
+		case isIndentRune(r):
+			prevSpace = true
+		default:
+			hashEnd = -1
+			prevSpace = false
+		}
+		p.l.advance()
+		if !isIndentRune(r) {
+			lineEnd = p.l.Pos()
+			textEnd = lineEnd
+		}
+	}
+	if hashEnd >= 0 {
+		textEnd = hashEnd
+	}
+	return textEnd, lineEnd
+}
+
+func isIndentRune(r rune) bool  { return r == ' ' || r == '\t' }
+func isLineEndRune(r rune) bool { return r == 0 || r == '\n' || r == '\r' }
+
+// --- stack ---
+
+// push opens a block, queueing its open node. Fails past MaxDepth.
+func (p *Parser) push(f frame) bool {
+	if len(p.stack) >= p.maxDepth() {
+		p.err = errDepthExceeded
+		return false
+	}
+	f.node.Flags |= FlagOpen
+	p.stack = append(p.stack, f)
+	p.queue(f.node)
+	return true
+}
+
+// pop closes the innermost block. The close carries the same kind, attribute
+// and kind-specific flags as the open, so a consumer sees a list's ordering on
+// both events; only the open/close bits and FlagLoose differ.
+func (p *Parser) pop(end Pos) Node {
+	f := p.stack[len(p.stack)-1]
+	p.stack = p.stack[:len(p.stack)-1]
+	n := f.node
+	n.Flags = n.Flags&^FlagOpen | FlagClose
+	if f.loose {
+		n.Flags |= FlagLoose
+	}
+	// The document is not a construct with a marker but the input itself, so it
+	// closes over every byte, trailing blank lines included.
+	if n.Kind == KindDocument {
+		end = p.l.Pos()
+	}
+	n.End = max(end, n.End)
+	return n
+}
 
 // closeTo pops down to depth, queueing each close node.
-//
-// TODO: implement.
-func (p *Parser) closeTo(depth int, end Pos) { panic("ohimark: todo") }
+func (p *Parser) closeTo(depth int, end Pos) {
+	for len(p.stack) > depth {
+		p.queue(p.pop(end))
+	}
+}
 
-// Line-start probes. Each reports whether the construct starts here and
-// consumes nothing on a false result.
-//
-// TODO: implement.
-func (p *Parser) atBlockQuote() (marker Node, ok bool)              { panic("ohimark: todo") }
-func (p *Parser) atBullet() (marker Node, ok bool)                  { panic("ohimark: todo") }
-func (p *Parser) atOrdered() (marker Node, start int32, ok bool)    { panic("ohimark: todo") }
-func (p *Parser) atATX() (marker Node, level int32, ok bool)        { panic("ohimark: todo") }
-func (p *Parser) atFence() (marker Node, ch byte, n int32, ok bool) { panic("ohimark: todo") }
-func (p *Parser) atThematicBreak() (n Node, ok bool)                { panic("ohimark: todo") }
-func (p *Parser) atBlankLine() bool                                 { panic("ohimark: todo") }
+// closeForSibling pops what the line did not continue, plus any list left
+// innermost. A list holds items and nothing else, so any other block starting
+// here is its sibling and ends it.
+func (p *Parser) closeForSibling(matched int) {
+	p.closeTo(matched, p.contentEnd)
+	for len(p.stack) > 1 && p.stack[len(p.stack)-1].node.Kind == KindList {
+		p.queue(p.pop(p.contentEnd))
+	}
+}
 
-// readFencedBody and readIndentedBody consume a verbatim leaf and emit one
-// KindRaw node. Both drive the lexer with [Lexer.SkipLine] rather than
-// tokenizing bytes that are literal by definition.
-//
-// TODO: implement.
-func (p *Parser) readFencedBody(ch byte, n int32) Node { panic("ohimark: todo") }
-func (p *Parser) readIndentedBody() Node               { panic("ohimark: todo") }
+func (p *Parser) queue(n Node) { p.pending = append(p.pending, n) }
 
 // errAt latches a *SyntaxError; the first error wins.
 func (p *Parser) errAt(pos Pos, msg string) {
