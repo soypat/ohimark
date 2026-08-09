@@ -3,6 +3,8 @@ You are tearing me apart, Markdown libraries of the Go ecosystem.
 
 I want something that is lightweight for simple parsing. Have not thought of extensibility yet but am open to breaking changes if the API is intuitive and easy to use.
 
+Parser currently is too complex for my taste, will work on it more in future.
+
 ## Example
 
 ```sh

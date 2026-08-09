@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/soypat/lexorg"
 	"github.com/soypat/ohimark"
 )
 
@@ -39,11 +39,9 @@ func run(flags Flags) (err error) {
 			return err
 		}
 	} else {
-		b, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return err
-		}
-		fp = bytes.NewReader(b)
+		var rd lexorg.StreamReaderAt
+		rd.Reset(os.Stdin, make([]byte, 2048))
+		fp = &rd
 	}
 
 	var parser ohimark.Parser

@@ -79,8 +79,21 @@ type Parser struct {
 	err     error
 
 	// delims memoizes the current leaf block's runs, escapes, entities and
-	// breaks. Cleared per block, capped by MaxInlineDelims.
+	// breaks, and pairs the constructs resolution made from them. Both are
+	// cleared per block and capped by MaxInlineDelims, and neither is grown
+	// ahead of use: a document with no inlines never pays for the memo.
 	delims []delim
+	pairs  []pair
+
+	// Emission cursor over delims during a leaf block's second pass.
+	inInline   bool
+	emitIdx    int32
+	emitPair   int32
+	emitPhase  uint8
+	emitPos    Pos
+	inlineStop Pos // Content limit when known up front, else negative.
+	inlineEnd  Pos // Where the content ends, once the scan has found it.
+	leafEnd    Pos // Where the leaf block's close node lands.
 
 	// MaxDepth caps block nesting. <=0 uses an internal default.
 	MaxDepth int
@@ -95,9 +108,11 @@ type Parser struct {
 // slices survive across resets.
 func (p *Parser) Reset(source string, r io.ReaderAt, buf []byte) error {
 	p.stack = p.stack[:0]
-	p.delims = p.delims[:0]
+	p.delims, p.pairs = p.delims[:0], p.pairs[:0]
 	p.pending, p.ipend = p.pending[:0], 0
-	p.contentEnd = 0
+	p.contentEnd, p.leafEnd = 0, 0
+	p.inInline = false
+	p.emitIdx, p.emitPair, p.emitPhase = 0, -1, phaseGap
 	p.started, p.done = false, false
 	p.err = nil
 	if n := 2*p.maxDepth() + 8; cap(p.pending) < n {
@@ -174,6 +189,17 @@ func (p *Parser) step() bool {
 		return p.push(frame{node: Node{Kind: KindDocument}})
 	case p.done:
 		return false
+	case p.inInline:
+		// The leaf's inlines are handed out one at a time; the block loop only
+		// resumes once they run out and the leaf closes.
+		if n, ok := p.inlineNext(); ok {
+			p.queue(n)
+			return true
+		}
+		p.inInline = false
+		p.contentEnd = p.leafEnd
+		p.closeTo(len(p.stack)-1, p.leafEnd)
+		return true
 	case p.l.IsDone():
 		p.done = true
 		p.closeTo(0, p.contentEnd)
@@ -265,8 +291,11 @@ func (p *Parser) parseLine() {
 		return
 	}
 
-	// Indent inside a container opened on this line is code, not content.
-	if codeStart >= 0 && !p.continuesParagraph(matched) {
+	// Indent inside a container opened on this line is code, not content. A
+	// paragraph can never be open here: its own scan consumed every line it
+	// continued onto, which is also where "indented code may not interrupt a
+	// paragraph" is decided.
+	if codeStart >= 0 {
 		p.openIndentedCode(matched, lineStart, codeStart, base)
 		return
 	}
@@ -287,15 +316,46 @@ func (p *Parser) parseLine() {
 		p.contentEnd = trim
 		return
 	}
-	if p.continuesParagraph(matched) {
-		p.paragraphText(contentStart)
-		return
-	}
 	p.closeForSibling(matched)
 	if !p.push(frame{node: Node{Kind: KindParagraph, Start: contentStart, End: contentStart}}) {
 		return
 	}
-	p.paragraphText(contentStart)
+	p.beginInline(contentStart, -1, -1)
+}
+
+// continuesLeaf reports whether the line at the cursor adds to the open leaf,
+// consuming its prefix and indent when it does. Every probe restores the cursor
+// on a false result, and the caller undoes the rest by rewinding to the line
+// start, so a line that ends the block is untouched when the block loop sees it.
+//
+// Indent is deliberately not a block start here: indented code may not interrupt
+// a paragraph, so a deeply indented line simply continues one.
+func (p *Parser) continuesLeaf(depth int) bool {
+	if p.l.IsDone() || p.matchOpen() != depth {
+		return false
+	}
+	if _, blank := p.scanIndent(int32(p.l.Col())); blank {
+		return false
+	}
+	if p.l.PeekRune() == '>' {
+		return false
+	}
+	if _, ok := p.atThematicBreak(); ok {
+		return false
+	}
+	if _, _, ok := p.atBullet(); ok {
+		return false
+	}
+	if _, _, ok := p.atOrdered(); ok {
+		return false
+	}
+	if _, ok := p.atATX(); ok {
+		return false
+	}
+	if _, _, _, ok := p.atFence(); ok {
+		return false
+	}
+	return true
 }
 
 // matchOpen consumes the line prefix of every open block that continues on this
@@ -348,13 +408,6 @@ func (p *Parser) matchQuote() bool {
 func (p *Parser) matchItem(col int32) bool {
 	p.skipIndent(col)
 	return int32(p.l.Col()) >= col || p.atLineEnd()
-}
-
-// continuesParagraph reports whether a paragraph is open exactly at the matched
-// depth, so a line beginning no block simply adds to it.
-func (p *Parser) continuesParagraph(matched int) bool {
-	top := len(p.stack) - 1
-	return matched == top && p.stack[top].node.Kind == KindParagraph
 }
 
 // blankLine ends the open leaf and marks the enclosing lists, whose looseness
@@ -428,30 +481,24 @@ func (p *Parser) openItem(matched int, marker Node, attr int32, flags Flags) boo
 
 // --- leaves ---
 
-// headingLine emits a whole ATX heading: it opens, holds one line, and closes.
+// headingLine opens an ATX heading over its one line. Its extent is known
+// before its content is scanned, so the scan is bounded to the text and the
+// closing sequence never reaches the inline layer.
 func (p *Parser) headingLine(matched int, marker Node) {
 	p.closeForSibling(matched)
 	if !p.push(frame{node: marker}) {
 		return
 	}
+	m := p.mark()
 	textEnd, lineEnd := p.readHeading(marker.End)
-	if textEnd > marker.End {
-		p.queue(Node{Kind: KindText, Start: marker.End, End: textEnd})
-	}
 	if lineEnd < marker.End {
 		lineEnd = marker.End
 	}
-	p.contentEnd = lineEnd
-	p.closeTo(len(p.stack)-1, lineEnd)
+	p.reset(m)
+	p.beginInline(marker.End, textEnd, lineEnd)
+	// The scan stopped at the content's end; the rest of the line is the
+	// closing sequence, and pass two needs no cursor.
 	p.l.SkipLine()
-}
-
-func (p *Parser) paragraphText(start Pos) {
-	trim, _, _ := p.readLine()
-	if trim > start {
-		p.queue(Node{Kind: KindText, Start: start, End: trim})
-		p.contentEnd = trim
-	}
 }
 
 func (p *Parser) openIndentedCode(matched int, lineStart, codeStart Pos, base int32) {
