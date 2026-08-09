@@ -9,6 +9,10 @@ var (
 	errDepthExceeded = errors.New("ohimark: container nesting exceeds MaxDepth")
 )
 
+// ErrLiteralUnavailable reports that a node's bytes are not in the parser's
+// window, so [Parser.TryNextLiteral] could not hand them back without a read.
+var ErrLiteralUnavailable = errors.New("ohimark: node literal not resident in window")
+
 // SyntaxError describes a lexing or parsing failure at an exact byte offset.
 type SyntaxError struct {
 	Source string

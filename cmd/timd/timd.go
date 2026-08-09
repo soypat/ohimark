@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/soypat/ohimark"
@@ -56,17 +57,22 @@ func run(flags Flags) error {
 			break
 		}
 		defer fp.Close()
-		parser.Reset(flags.Target, fp, buf)
+		err = parser.Reset(flags.Target, fp, buf)
+		if err != nil {
+			break
+		}
+		tf := transformer{src: fp, name: flags.Target, dir: filepath.Dir(flags.Target)}
+		// The whole result is buffered before anything is written: the
+		// transform reads the file it is replacing.
 		var output bytes.Buffer
-		err = transform(&parser, &output)
+		err = tf.run(&parser, &output)
 		if err != nil {
 			break
 		}
-		_, err = fp.Seek(0, 0)
-		if err != nil {
-			break
-		}
-		err = os.WriteFile(flags.Target, output.Bytes(), 0777)
+		err = os.WriteFile(flags.Target, output.Bytes(), info.Mode().Perm())
 	}
-	return fmt.Errorf("failure during transform: %w", err)
+	if err != nil {
+		return fmt.Errorf("failure during transform: %w", err)
+	}
+	return nil
 }

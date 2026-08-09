@@ -1044,6 +1044,133 @@ func TestParserNoAllocs(t *testing.T) {
 	}
 }
 
+// nextNodes drains a parser with Next alone, which is what TryNextLiteral must
+// agree with node for node.
+func nextNodes(t *testing.T, src string, bufSize int) []Node {
+	t.Helper()
+	var p Parser
+	if err := p.Reset(t.Name(), strings.NewReader(src), make([]byte, bufSize)); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	var nodes []Node
+	for {
+		n, err := p.Next()
+		if err == io.EOF {
+			return nodes
+		} else if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		nodes = append(nodes, n)
+	}
+}
+
+// TestParserTryNextLiteral runs every case through TryNextLiteral over a window
+// holding the whole source, where no span can be missing: the node stream must
+// match Next's and every literal must be the span's bytes.
+func TestParserTryNextLiteral(t *testing.T) {
+	const bufSize = 64 << 10
+	for _, tt := range parseTests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := nextNodes(t, tt.src, bufSize)
+			var p Parser
+			if err := p.Reset(t.Name(), strings.NewReader(tt.src), make([]byte, bufSize)); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; ; i++ {
+				n, lit, err := p.TryNextLiteral()
+				if err == io.EOF {
+					if i != len(want) {
+						t.Fatalf("got %d nodes, want %d", i, len(want))
+					}
+					return
+				} else if err != nil {
+					t.Fatalf("node %d: TryNextLiteral: %v", i, err)
+				}
+				if i >= len(want) {
+					t.Fatalf("node %d (%s) past the %d Next reported", i, n.Kind, len(want))
+				}
+				if n != want[i] {
+					t.Fatalf("node %d = %+v, want %+v", i, n, want[i])
+				}
+				if got := tt.src[n.Start:n.End]; string(lit) != got {
+					t.Fatalf("node %d (%s) literal = %q, want %q", i, n.Kind, lit, got)
+				}
+			}
+		})
+	}
+}
+
+// TestParserTryNextLiteralUnavailable pins the failure contract: a span the
+// window cannot hold costs a zero Node and leaves it queued, so the following
+// Next hands back the very node that failed.
+func TestParserTryNextLiteralUnavailable(t *testing.T) {
+	// A paragraph well past MinWindow, so its text node cannot be resident.
+	src := "# h\n\n" + strings.Repeat("word ", 64) + "\n\ntail\n"
+	want := nextNodes(t, src, MinWindow)
+
+	var p Parser
+	if err := p.Reset(t.Name(), strings.NewReader(src), make([]byte, MinWindow)); err != nil {
+		t.Fatal(err)
+	}
+	misses := 0
+	for i := 0; ; i++ {
+		n, lit, err := p.TryNextLiteral()
+		switch {
+		case errors.Is(err, ErrLiteralUnavailable):
+			misses++
+			if n != (Node{}) || lit != nil {
+				t.Fatalf("node %d: failed TryNextLiteral returned %+v %q, want zero", i, n, lit)
+			}
+			// The node was not consumed, so Next must still produce it.
+			n, err = p.Next()
+			if err != nil {
+				t.Fatalf("node %d: Next after miss: %v", i, err)
+			}
+		case err == io.EOF:
+			if i != len(want) {
+				t.Fatalf("got %d nodes, want %d", i, len(want))
+			}
+			if misses == 0 {
+				t.Fatal("no span outran the window, so the failure path went untested")
+			}
+			return
+		case err != nil:
+			t.Fatalf("node %d: TryNextLiteral: %v", i, err)
+		default:
+			if got := src[n.Start:n.End]; string(lit) != got {
+				t.Fatalf("node %d (%s) literal = %q, want %q", i, n.Kind, lit, got)
+			}
+		}
+		if i >= len(want) {
+			t.Fatalf("node %d (%s) past the %d Next reported", i, n.Kind, len(want))
+		}
+		if n != want[i] {
+			t.Fatalf("node %d = %+v, want %+v", i, n, want[i])
+		}
+	}
+}
+
+func TestParserTryNextLiteralNoAllocs(t *testing.T) {
+	src := strings.Repeat("# Head\n\ntext here\n\n- a\n- b\n\n> quoted\n\n    code\n\n", 32)
+	r := strings.NewReader(src)
+	buf := make([]byte, 4096)
+	var p Parser
+	drain := func() {
+		if err := p.Reset("t", r, buf); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			if _, _, err := p.TryNextLiteral(); err != nil {
+				return
+			}
+		}
+	}
+	drain() // Warm up: grow the container spine before measuring.
+	if allocs := testing.AllocsPerRun(10, drain); allocs != 0 {
+		t.Errorf("AllocsPerRun = %v, want 0", allocs)
+	}
+}
+
 func FuzzParserBalance(f *testing.F) {
 	for _, tt := range parseTests {
 		f.Add(tt.src)

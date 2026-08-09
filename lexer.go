@@ -54,8 +54,9 @@ type Lexer struct {
 
 	col int32 // 0-based column of peek[0], tabs expanded.
 
-	// bufcap is the fill size last supplied. lexorg.WindowReader forwards none
-	// of Window's buffer accessors, so there is no asking whether it has one.
+	// bufcap is the fill size last supplied. lexorg.WindowReader forwards the
+	// resident bytes but not the fill size, and the resident bytes are empty
+	// until the first fill, so there is no asking whether it has a buffer.
 	bufcap int32
 
 	err error
@@ -208,6 +209,20 @@ func (l *Lexer) PeekAt(i int) rune {
 		return 0
 	}
 	return l.peek[i]
+}
+
+// Resident returns the bytes over [start,end) when the window holds them all.
+// The slice aliases the window buffer, so the next advance invalidates it.
+func (l *Lexer) Resident(start, end Pos) ([]byte, bool) {
+	if end < start {
+		return nil, false
+	}
+	buf, base := l.w.Buffer()
+	i, j := int64(start)-base, int64(end)-base
+	if i < 0 || j > int64(len(buf)) {
+		return nil, false
+	}
+	return buf[i:j], true
 }
 
 // fill tops the peek buffer back up.

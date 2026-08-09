@@ -29,5 +29,17 @@ document close len: 400
 2026/08/08 13:45:21 finished 74.653µs
 ```
 
+## [`timd`](./cmd/timd/) In-place Markdown Templating
+A very basic in-place templating markdown tool. In-place means there is not build output; the markdown you write is the generation output. See example [`cmd/timd/examples/code-example.md`](./cmd/timd/examples/code-example.md).
+
+Support for:
+- Code block updating from file, a.k.a: Idempotent in-place code block updating. 
+
+The following command will run `timd` on the code-example.md and overwrite it if code it sourced changes. This ensures your documentation stays up to date with your code!
+```sh
+go run ./cmd/timd -tgt ./cmd/timd/examples/code-example.md
+```
+code-example.md should not change unless the code you inserted via `.code` templates changed.
+
 ## AI notice
 This package was designed by a human and assisted by an AI. We follow Oxide's RFD on LLM usage: https://rfd.shared.oxide.computer/rfd/0576 

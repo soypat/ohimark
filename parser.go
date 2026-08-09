@@ -127,10 +127,40 @@ func (p *Parser) Reset(source string, r io.ReaderAt, buf []byte) error {
 // Next returns the next node. Returns io.EOF once, after the document's close
 // node, and the latched error on every call after a failure.
 func (p *Parser) Next() (Node, error) {
+	n, err := p.peek()
+	if err != nil {
+		return Node{}, err
+	}
+	p.ipend++
+	return n, nil
+}
+
+// TryNextLiteral is [Parser.Next] plus the node's source bytes, for a node whose
+// span the window still holds whole. It never reads: a span the cursor has left
+// behind, or one longer than the window, fails with [ErrLiteralUnavailable] and
+// leaves the node queued, so the following Next returns it. That is the only
+// contract a stream can keep, where seeking back is not a read but an error.
+//
+// A close node spans its whole construct and a code block its whole body, so
+// both fail for all but small ones. lit aliases the window buffer, which the
+// next call on p invalidates.
+func (p *Parser) TryNextLiteral() (n Node, lit []byte, err error) {
+	n, err = p.peek()
+	if err != nil {
+		return Node{}, nil, err
+	}
+	lit, ok := p.l.Resident(n.Start, n.End)
+	if !ok {
+		return Node{}, nil, ErrLiteralUnavailable
+	}
+	p.ipend++
+	return n, lit, nil
+}
+
+// peek runs the machine to the next node without consuming it.
+func (p *Parser) peek() (Node, error) {
 	if p.ipend < len(p.pending) {
-		n := p.pending[p.ipend]
-		p.ipend++
-		return n, nil
+		return p.pending[p.ipend], nil
 	}
 	p.pending, p.ipend = p.pending[:0], 0
 	if err := p.Err(); err != nil {
@@ -144,7 +174,6 @@ func (p *Parser) Next() (Node, error) {
 			return Node{}, io.EOF
 		}
 	}
-	p.ipend = 1
 	return p.pending[0], nil
 }
 
