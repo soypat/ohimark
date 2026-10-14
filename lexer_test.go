@@ -81,6 +81,10 @@ var lexTests = []struct {
 		tk(TokLT, 0, 1), tk(TokWord, 1, 9), tk(TokGT, 9, 10),
 	}},
 	{"dot does not run", "..", []tokexp{tk(TokDot, 0, 1), tk(TokDot, 1, 2)}},
+	{"pipe splits words", "a||b", []tokexp{
+		tk(TokWord, 0, 1), tk(TokPipe, 1, 2), tk(TokPipe, 2, 3), tk(TokWord, 3, 4),
+	}},
+	{"escaped pipe", `\|`, []tokexp{tk(TokEscape, 0, 2)}},
 
 	// --- escapes ---
 	{"escape star", `\*`, []tokexp{tk(TokEscape, 0, 2)}},

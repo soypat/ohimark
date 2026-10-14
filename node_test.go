@@ -15,6 +15,9 @@ func TestKindPredicates(t *testing.T) {
 		{KindBlockQuote, true, true, false, false, true},
 		{KindList, true, true, false, false, true},
 		{KindItem, true, true, false, false, true},
+		{KindTable, true, true, false, false, true},
+		{KindTableRow, true, true, false, false, true},
+		{KindTableCell, false, true, false, false, true},
 		{KindParagraph, false, true, false, false, true},
 		{KindHeading, false, true, false, false, true},
 		{KindCodeBlock, false, true, false, false, true},
@@ -71,7 +74,7 @@ func TestTokenPredicates(t *testing.T) {
 	for _, tok := range []Token{
 		TokUndefined, TokIllegal, TokEOF, TokWord, TokDigits, TokSpace, TokNewline,
 		TokPlus, TokBang, TokLT, TokBracketL, TokBracketR, TokParenL, TokParenR,
-		TokDot, TokEscape, TokEntity,
+		TokDot, TokPipe, TokEscape, TokEntity,
 	} {
 		if tok.IsRun() {
 			t.Errorf("%s.IsRun() = true, want false", tok)

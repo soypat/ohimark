@@ -67,11 +67,8 @@ func dumpNodes(t *testing.T, src string, bufSize int) string {
 		if n.Kind.IsLeaf() && (n.IsOpen() || n.IsClose()) {
 			t.Fatalf("leaf node %d (%s) carries an open/close flag", i, n.Kind)
 		}
-		// A list holds items and nothing else; everything else holds no items.
-		if len(open) > 0 && (n.IsOpen() || n.Kind.IsLeaf()) {
-			if parent := open[len(open)-1].Kind; (parent == KindList) != (n.Kind == KindItem) {
-				t.Fatalf("node %d: %s directly inside %s", i, n.Kind, parent)
-			}
+		if len(open) > 0 && (n.IsOpen() || n.Kind.IsLeaf()) && !nests(open[len(open)-1].Kind, n.Kind) {
+			t.Fatalf("node %d: %s directly inside %s", i, n.Kind, open[len(open)-1].Kind)
 		}
 		switch {
 		case n.IsOpen():
@@ -102,6 +99,24 @@ func dumpNodes(t *testing.T, src string, bufSize int) string {
 		t.Errorf("Err after clean drain = %v, want nil", err)
 	}
 	return sb.String()
+}
+
+// holdsOnly maps each container that admits a single kind of child to it.
+var holdsOnly = map[Kind]Kind{KindList: KindItem, KindTable: KindTableRow, KindTableRow: KindTableCell}
+
+// nests reports whether child may sit directly inside parent. A list holds
+// items and nothing else, a table rows, a row cells; and each of those sits
+// nowhere but in its own parent.
+func nests(parent, child Kind) bool {
+	if want, ok := holdsOnly[parent]; ok {
+		return child == want
+	}
+	for _, kid := range holdsOnly {
+		if child == kid {
+			return false
+		}
+	}
+	return true
 }
 
 const bt = "`" // Fenced-code cases need backticks, which raw literals cannot hold.
@@ -797,6 +812,14 @@ var parseEdgeTests = []struct {
 		`list close 0..12 "- a\n\n      c" attr=45`,
 		`document close 0..13 "- a\n\n      c\n"`,
 	}},
+	// NUL reads as U+FFFD, so it ends no line: the heading's text runs past it.
+	{"nul is text", "# a\x00b\n", []string{
+		`document open 0..0 ""`,
+		`heading open 0..2 "# " attr=1`,
+		`text 2..5 "a\x00b"`,
+		`heading close 0..5 "# a\x00b" attr=1`,
+		`document close 0..6 "# a\x00b\n"`,
+	}},
 }
 
 // The edge cases run through every check the main table does.
@@ -1024,7 +1047,7 @@ func TestParserReadError(t *testing.T) {
 }
 
 func TestParserNoAllocs(t *testing.T) {
-	src := strings.Repeat("# Head\n\ntext here\n\n- a\n- b\n\n> quoted\n\n    code\n\n", 32)
+	src := strings.Repeat("# Head\n\ntext here\n\n- a\n- b\n\n> quoted\n\n    code\n\n| a | b |\n|:-|-:|\n| c |\n\n", 32)
 	r := strings.NewReader(src)
 	buf := make([]byte, 4096)
 	var p Parser
@@ -1151,7 +1174,7 @@ func TestParserTryNextLiteralUnavailable(t *testing.T) {
 }
 
 func TestParserTryNextLiteralNoAllocs(t *testing.T) {
-	src := strings.Repeat("# Head\n\ntext here\n\n- a\n- b\n\n> quoted\n\n    code\n\n", 32)
+	src := strings.Repeat("# Head\n\ntext here\n\n- a\n- b\n\n> quoted\n\n    code\n\n| a | b |\n|:-|-:|\n| c |\n\n", 32)
 	r := strings.NewReader(src)
 	buf := make([]byte, 4096)
 	var p Parser
@@ -1199,10 +1222,8 @@ func FuzzParserBalance(f *testing.F) {
 			if n.Start < 0 || n.End > Pos(len(src)) || n.Start > n.End {
 				t.Fatalf("%s span %v..%v outside 0..%d", n.Kind, n.Start, n.End, len(src))
 			}
-			if len(open) > 0 && (n.IsOpen() || n.Kind.IsLeaf()) {
-				if parent := open[len(open)-1].Kind; (parent == KindList) != (n.Kind == KindItem) {
-					t.Fatalf("%s directly inside %s over %q", n.Kind, parent, src)
-				}
+			if len(open) > 0 && (n.IsOpen() || n.Kind.IsLeaf()) && !nests(open[len(open)-1].Kind, n.Kind) {
+				t.Fatalf("%s directly inside %s over %q", n.Kind, open[len(open)-1].Kind, src)
 			}
 			switch {
 			case n.IsOpen():

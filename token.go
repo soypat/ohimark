@@ -43,6 +43,7 @@ const (
 	TokParenL   // (
 	TokParenR   // )
 	TokDot      // .
+	TokPipe     // |
 
 	// Composite. The span covers every byte, leading '\' or '&' included.
 	TokEscape // <escape>

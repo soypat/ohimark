@@ -25,6 +25,9 @@ type Node struct {
 	//	KindHeading    level, 1..6
 	//	KindList       start number if FlagOrdered, else bullet byte
 	//	KindItem       ordinal within the list, 0-based
+	//	KindTable      column count, from the delimiter row
+	//	KindTableRow   ordinal within the table, 0-based; row 0 is the header
+	//	KindTableCell  alignment: [AlignLeft], [AlignRight], [AlignCenter] or 0
 	//	KindCodeBlock  fence run length if FlagFenced
 	//	KindEmph, KindStrong, KindCodeSpan   delimiter byte
 	//	otherwise      0
@@ -72,6 +75,8 @@ const (
 	KindBlockQuote // blockquote
 	KindList       // list
 	KindItem       // item
+	KindTable      // table
+	KindTableRow   // tablerow
 	containerEnd
 
 	// Leaf blocks. Open/close pairs; inline nodes appear between them.
@@ -80,6 +85,7 @@ const (
 	KindHeading       // heading
 	KindCodeBlock     // codeblock
 	KindThematicBreak // thematicbreak
+	KindTableCell     // tablecell
 	leafEnd
 
 	// Inline containers. Open/close pairs.
@@ -136,4 +142,16 @@ const (
 	FlagOrdered // KindList: "1." rather than "-".
 	FlagLoose   // KindList close: an item was blank-line separated.
 	FlagFenced  // KindCodeBlock: ``` rather than a 4-space indent.
+)
+
+// Alignment bits a KindTableCell carries in Attr, read off the colons of its
+// column in the delimiter row.
+//
+// A row may hold fewer cells than its table's Attr; GFM pads it with empty cells
+// on render, which is the renderer's to do. Cells past the column count are
+// dropped, so the node stream never outgrows the input.
+const (
+	AlignLeft   = 1 << iota              // ":--"
+	AlignRight                           // "--:"
+	AlignCenter = AlignLeft | AlignRight // ":-:"
 )

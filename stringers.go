@@ -32,19 +32,21 @@ func _() {
 	_ = x[TokParenL-21]
 	_ = x[TokParenR-22]
 	_ = x[TokDot-23]
-	_ = x[TokEscape-24]
-	_ = x[TokEntity-25]
+	_ = x[TokPipe-24]
+	_ = x[TokEscape-25]
+	_ = x[TokEntity-26]
 }
 
-const _Token_name = "undefinedillegalEOF<word><digits><space><newline>runBeg#*_`~->runEnd+!<[]().<escape><entity>"
+const _Token_name = "undefinedillegalEOF<word><digits><space><newline>runBeg#*_`~->runEnd+!<[]().|<escape><entity>"
 
-var _Token_index = [...]uint8{0, 9, 16, 19, 25, 33, 40, 49, 55, 56, 57, 58, 59, 60, 61, 62, 68, 69, 70, 71, 72, 73, 74, 75, 76, 84, 92}
+var _Token_index = [...]uint8{0, 9, 16, 19, 25, 33, 40, 49, 55, 56, 57, 58, 59, 60, 61, 62, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 85, 93}
 
 func (i Token) String() string {
-	if i >= Token(len(_Token_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_Token_index)-1 {
 		return "Token(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _Token_name[_Token_index[i]:_Token_index[i+1]]
+	return _Token_name[_Token_index[idx]:_Token_index[idx+1]]
 }
 func _() {
 	// An "invalid array index" compiler error signifies that the constant values have changed.
@@ -56,39 +58,43 @@ func _() {
 	_ = x[KindBlockQuote-3]
 	_ = x[KindList-4]
 	_ = x[KindItem-5]
-	_ = x[containerEnd-6]
-	_ = x[leafBeg-7]
-	_ = x[KindParagraph-8]
-	_ = x[KindHeading-9]
-	_ = x[KindCodeBlock-10]
-	_ = x[KindThematicBreak-11]
-	_ = x[leafEnd-12]
-	_ = x[inlineBeg-13]
-	_ = x[KindEmph-14]
-	_ = x[KindStrong-15]
-	_ = x[KindLink-16]
-	_ = x[KindImage-17]
-	_ = x[KindCodeSpan-18]
-	_ = x[KindText-19]
-	_ = x[KindEscape-20]
-	_ = x[KindEntity-21]
-	_ = x[KindAutolink-22]
-	_ = x[KindSoftBreak-23]
-	_ = x[KindHardBreak-24]
-	_ = x[inlineEnd-25]
-	_ = x[KindInfo-26]
-	_ = x[KindDest-27]
-	_ = x[KindTitle-28]
-	_ = x[KindRaw-29]
+	_ = x[KindTable-6]
+	_ = x[KindTableRow-7]
+	_ = x[containerEnd-8]
+	_ = x[leafBeg-9]
+	_ = x[KindParagraph-10]
+	_ = x[KindHeading-11]
+	_ = x[KindCodeBlock-12]
+	_ = x[KindThematicBreak-13]
+	_ = x[KindTableCell-14]
+	_ = x[leafEnd-15]
+	_ = x[inlineBeg-16]
+	_ = x[KindEmph-17]
+	_ = x[KindStrong-18]
+	_ = x[KindLink-19]
+	_ = x[KindImage-20]
+	_ = x[KindCodeSpan-21]
+	_ = x[KindText-22]
+	_ = x[KindEscape-23]
+	_ = x[KindEntity-24]
+	_ = x[KindAutolink-25]
+	_ = x[KindSoftBreak-26]
+	_ = x[KindHardBreak-27]
+	_ = x[inlineEnd-28]
+	_ = x[KindInfo-29]
+	_ = x[KindDest-30]
+	_ = x[KindTitle-31]
+	_ = x[KindRaw-32]
 }
 
-const _Kind_name = "undefineddocumentcontainerBegblockquotelistitemcontainerEndleafBegparagraphheadingcodeblockthematicbreakleafEndinlineBegemphstronglinkimagecodespantextescapeentityautolinksoftbreakhardbreakinlineEndinfodesttitleraw"
+const _Kind_name = "undefineddocumentcontainerBegblockquotelistitemtabletablerowcontainerEndleafBegparagraphheadingcodeblockthematicbreaktablecellleafEndinlineBegemphstronglinkimagecodespantextescapeentityautolinksoftbreakhardbreakinlineEndinfodesttitleraw"
 
-var _Kind_index = [...]uint8{0, 9, 17, 29, 39, 43, 47, 59, 66, 75, 82, 91, 104, 111, 120, 124, 130, 134, 139, 147, 151, 157, 163, 171, 180, 189, 198, 202, 206, 211, 214}
+var _Kind_index = [...]uint8{0, 9, 17, 29, 39, 43, 47, 52, 60, 72, 79, 88, 95, 104, 117, 126, 133, 142, 146, 152, 156, 161, 169, 173, 179, 185, 193, 202, 211, 220, 224, 228, 233, 236}
 
 func (i Kind) String() string {
-	if i >= Kind(len(_Kind_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_Kind_index)-1 {
 		return "Kind(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _Kind_name[_Kind_index[i]:_Kind_index[i+1]]
+	return _Kind_name[_Kind_index[idx]:_Kind_index[idx+1]]
 }
