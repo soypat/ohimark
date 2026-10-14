@@ -512,6 +512,20 @@ var inlineTests = []struct {
 		`blockquote close 2..5 "> b"`,
 		`document close 0..6 "a\n> b\n"`,
 	}},
+	// Leaf content starts at an edge: the ">" before it is no punctuation for
+	// flanking to see, so the opener cannot also close and dodge mod-3.
+	{"flanking ignores quote marker", ">*(a**\n", []string{
+		`document open 0..0 ""`,
+		`blockquote open 0..1 ">"`,
+		`paragraph open 1..1 ""`,
+		`emph open 1..2 "*" attr=42`,
+		`text 2..4 "(a"`,
+		`emph close 1..5 "*(a*" attr=42`,
+		`text 5..6 "*"`,
+		`paragraph close 1..6 "*(a**"`,
+		`blockquote close 0..6 ">*(a**"`,
+		`document close 0..7 ">*(a**\n"`,
+	}},
 	{"code block content is not inline", "    *a*\n", []string{
 		`document open 0..0 ""`,
 		`codeblock open 0..4 "    "`,

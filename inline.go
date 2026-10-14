@@ -67,6 +67,7 @@ const (
 	dActive // Not yet consumed by a match.
 	dHard   // Break: the line ended with two spaces or a backslash.
 	dImage  // Bracket preceded by '!'.
+	dPipe   // Escape of '|'.
 )
 
 // pair is one resolved construct: the bytes its open node covers and the bytes
@@ -102,6 +103,9 @@ func (p *Parser) beginInline(start, stop, leafEnd Pos) {
 	p.inlineEnd = start
 	p.emitIdx, p.emitPair, p.emitPhase = 0, -1, phaseGap
 	p.emitPos = start
+	// Content starts at an edge, which flanking reads as whitespace whatever
+	// byte precedes it: a ">" or a cell's "|" is no part of the leaf.
+	p.l.prev = 0
 	p.inlineScan(len(p.stack) - 1)
 	if leafEnd >= 0 {
 		p.leafEnd = leafEnd
@@ -118,10 +122,7 @@ func (p *Parser) inlineScan(depth int) {
 	last := p.l.Pos() // End of the last token that was not trailing space.
 	prevTok := TokUndefined
 	var prevStart, prevEnd Pos
-	for {
-		if p.inlineStop >= 0 && p.l.Pos() >= p.inlineStop {
-			break
-		}
+	for !p.atStop() {
 		tok, start, end := p.l.Next()
 		if tok == TokEOF || tok == TokIllegal {
 			break
@@ -136,7 +137,11 @@ func (p *Parser) inlineScan(depth int) {
 			continue
 
 		case TokEscape, TokEntity:
-			p.pushDelim(delim{role: roleLeaf, tok: tok, start: start, end: end})
+			d := delim{role: roleLeaf, tok: tok, start: start, end: end}
+			if tok == TokEscape && p.l.prev == '|' {
+				d.flags |= dPipe
+			}
+			p.pushDelim(d)
 
 		case TokTick, TokStar, TokUnderscore:
 			d := delim{role: roleRun, tok: tok, start: start, end: end, flags: dActive}
@@ -178,6 +183,20 @@ func (p *Parser) inlineScan(depth int) {
 	p.inlineEnd = last
 }
 
+// atStop reports whether the scan has reached the content's known end.
+func (p *Parser) atStop() bool { return p.inlineStop >= 0 && p.l.Pos() >= p.inlineStop }
+
+// peekInline is [Lexer.PeekRune] bounded by the content's known end, past which
+// it reports end of input. A heading's text and a table cell are each parsed in
+// isolation, so no construct may reach past them, and their edges flank like
+// the file's.
+func (p *Parser) peekInline() rune {
+	if p.atStop() {
+		return 0
+	}
+	return p.l.PeekRune()
+}
+
 // scanBreak records the line ending and reports whether the block goes on. The
 // break's span reaches the next line's first content byte, so the container
 // prefix it steps over belongs to no node.
@@ -207,7 +226,7 @@ func (p *Parser) scanBreak(depth int, last Pos, prevTok Token, prevStart, prevEn
 // abutting the run. A zero rune is a file edge, which both rules read as
 // whitespace.
 func (p *Parser) flanking(d *delim) {
-	before, after := p.l.PrevRune(), p.l.PeekRune()
+	before, after := p.l.PrevRune(), p.peekInline()
 	bSpace, aSpace := before == 0 || isSpaceRune(before), after == 0 || isSpaceRune(after)
 	bPunct, aPunct := isPunctRune(before), isPunctRune(after)
 	left := !aSpace && (!aPunct || bSpace || bPunct)
@@ -230,7 +249,7 @@ func (p *Parser) flanking(d *delim) {
 // records of its own. Reading it here rather than at resolution time is what
 // keeps the whole layer single-read: the cursor is already standing on it.
 func (p *Parser) scanLinkTail() {
-	if p.l.PeekRune() != '(' {
+	if p.peekInline() != '(' {
 		return
 	}
 	m := p.mark()
@@ -240,13 +259,13 @@ func (p *Parser) scanLinkTail() {
 	destStart := p.l.Pos()
 	depth := 0
 	for {
-		r := p.l.PeekRune()
-		if r == 0 || isLineEndRune(r) || isSpaceRune(r) {
+		r := p.peekInline()
+		if isLineEndRune(r) || isSpaceRune(r) {
 			break
 		}
 		if r == '\\' {
 			p.l.advance()
-			if p.l.PeekRune() != 0 {
+			if p.peekInline() != 0 {
 				p.l.advance()
 			}
 			continue
@@ -264,20 +283,23 @@ func (p *Parser) scanLinkTail() {
 	destEnd := p.l.Pos()
 	titleStart, titleEnd := Pos(0), Pos(0)
 	p.skipInlineSpace()
-	if q := p.l.PeekRune(); q == '"' || q == '\'' {
+	if q := p.peekInline(); q == '"' || q == '\'' {
 		p.l.advance()
 		titleStart = p.l.Pos()
 		for {
-			r := p.l.PeekRune()
+			r := p.peekInline()
 			if r == 0 || r == q {
 				break
 			}
 			if r == '\\' {
 				p.l.advance()
+				if p.peekInline() == 0 {
+					break
+				}
 			}
 			p.l.advance()
 		}
-		if p.l.PeekRune() != q {
+		if p.peekInline() != q {
 			p.reset(m)
 			return
 		}
@@ -285,7 +307,7 @@ func (p *Parser) scanLinkTail() {
 		p.l.advance()
 		p.skipInlineSpace()
 	}
-	if p.l.PeekRune() != ')' {
+	if p.peekInline() != ')' {
 		p.reset(m)
 		return
 	}
@@ -299,10 +321,9 @@ func (p *Parser) scanLinkTail() {
 	}
 }
 
-// skipInlineSpace steps over spaces, tabs and one line ending, which a link
-// tail may be broken across.
+// skipInlineSpace steps over the spaces and tabs inside a link tail.
 func (p *Parser) skipInlineSpace() {
-	for isIndentRune(p.l.PeekRune()) {
+	for isIndentRune(p.peekInline()) {
 		p.l.advance()
 	}
 }
@@ -312,7 +333,7 @@ func (p *Parser) scanAutolink(start Pos) (n Node, ok bool) {
 	m := p.mark()
 	scheme, at, chars := 0, false, 0
 	for i := 0; ; i++ {
-		r := p.l.PeekRune()
+		r := p.peekInline()
 		switch {
 		case r == '>':
 			p.l.advance()
@@ -321,7 +342,7 @@ func (p *Parser) scanAutolink(start Pos) (n Node, ok bool) {
 				return Node{}, false
 			}
 			return Node{Kind: KindAutolink, Start: start, End: p.l.Pos()}, true
-		case r == 0 || isLineEndRune(r) || isSpaceRune(r) || r == '<':
+		case isLineEndRune(r) || isSpaceRune(r) || r == '<':
 			p.reset(m)
 			return Node{}, false
 		case r == ':' && scheme == 0 && chars > 0:
@@ -394,7 +415,11 @@ func (p *Parser) inlineResolve() {
 // resolveCode pairs backtick runs of equal length and silences everything
 // between them. Breaks stay live, so a code span crossing lines still reports
 // where its lines join instead of swallowing a container prefix into its text.
+//
+// So does a table cell's "\|": GFM splits the row before parsing inlines and
+// unescapes its pipes wherever they sit, code spans included.
 func (p *Parser) resolveCode() {
+	cell := p.stack[len(p.stack)-1].node.Kind == KindTableCell
 	for i := range p.delims {
 		o := &p.delims[i]
 		if o.role != roleRun || o.tok != TokTick || o.flags&dActive == 0 {
@@ -415,7 +440,7 @@ func (p *Parser) resolveCode() {
 			o.flags &^= dActive
 			c.flags &^= dActive
 			for k := i + 1; k < j; k++ {
-				if d := &p.delims[k]; d.role != roleBreak {
+				if d := &p.delims[k]; d.role != roleBreak && !(cell && d.flags&dPipe != 0) {
 					d.flags &^= dActive | dCanOpen | dCanClose
 					d.role = roleRun
 					d.openUsed, d.closeUsed = 0, 0

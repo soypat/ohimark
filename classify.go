@@ -32,6 +32,7 @@ var tokOf = [256]Token{
 
 	'+': TokPlus, '!': TokBang, '<': TokLT, '[': TokBracketL,
 	']': TokBracketR, '(': TokParenL, ')': TokParenR, '.': TokDot,
+	'|': TokPipe,
 }
 
 // isSpecial reports whether b starts a token other than TokWord.

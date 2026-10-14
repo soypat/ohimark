@@ -3,8 +3,9 @@ package ohimark
 import "io"
 
 const (
-	defaultMaxDepth  = 64
-	defaultMaxDelims = 1024
+	defaultMaxDepth     = 64
+	defaultMaxDelims    = 1024
+	defaultMaxTableCols = 256
 
 	maxATXLevel    = 6 // Hashes past this are text, not a heading.
 	maxBlockIndent = 3 // Indent past which a line is code, not a block marker.
@@ -18,7 +19,7 @@ type frame struct {
 	node  Node
 	col   int32 // KindItem, KindCodeBlock: the column its content starts at.
 	fence int32 // KindCodeBlock: opening fence run length; 0 when indented.
-	count int32 // KindList: items opened so far, which is the next ordinal.
+	count int32 // KindList, KindTable, KindTableRow: items, rows or cells opened so far.
 	ch    byte  // KindCodeBlock: fence character.
 	loose bool  // KindList: an item followed a blank line.
 	blank bool  // KindList, KindItem: the last line inside it was blank.
@@ -46,8 +47,9 @@ type mark struct {
 // document text: every [Node] is a span the caller reads back through the
 // io.ReaderAt it supplied.
 //
-// Memory is bounded by three things: the window buffer, MaxDepth nestings, and
-// MaxInlineDelims delimiter runs per leaf block. Nothing else grows with input.
+// Memory is bounded by four things: the window buffer, MaxDepth nestings,
+// MaxInlineDelims delimiter runs per leaf block, and MaxTableColumns. Nothing
+// else grows with input.
 //
 // The block layer reads the [Lexer]'s rune cursor rather than its tokens.
 // Container prefixes are defined in columns, and a single space token may span
@@ -85,6 +87,13 @@ type Parser struct {
 	delims []delim
 	pairs  []pair
 
+	// aligns holds the open table's column alignments, read off its delimiter
+	// row before the header's first cell goes out. Only atTable writes it, and
+	// never while a table is open: a table admits nothing above it but its own
+	// row and cell, and anything else ends it first. So every column below the
+	// table's Attr stays valid until it closes. Grown on first use.
+	aligns []uint8
+
 	// Emission cursor over delims during a leaf block's second pass.
 	inInline   bool
 	emitIdx    int32
@@ -101,6 +110,10 @@ type Parser struct {
 	// is not an error: the parser rewinds to the block start and re-scans
 	// without the memo, trading reads for memory. <=0 uses an internal default.
 	MaxInlineDelims int
+	// MaxTableColumns caps a table's width, the one thing a table remembers per
+	// column. A wider delimiter row starts no table, so its lines read as a
+	// paragraph. <=0 uses an internal default.
+	MaxTableColumns int
 }
 
 // Reset points the parser at the start of r, reading through buf. Forwards to
@@ -207,6 +220,13 @@ func (p *Parser) maxDelims() int {
 	return defaultMaxDelims
 }
 
+func (p *Parser) maxTableCols() int32 {
+	if p.MaxTableColumns > 0 {
+		return int32(min(p.MaxTableColumns, 1<<30))
+	}
+	return defaultMaxTableCols
+}
+
 // step runs the machine far enough to queue at least one node, and reports
 // false once the document is finished.
 func (p *Parser) step() bool {
@@ -228,6 +248,11 @@ func (p *Parser) step() bool {
 		p.inInline = false
 		p.contentEnd = p.leafEnd
 		p.closeTo(len(p.stack)-1, p.leafEnd)
+		return true
+	case p.stack[len(p.stack)-1].node.Kind == KindTableRow:
+		// A row's cells come out one per step, each a leaf with its inlines, so
+		// the pending queue stays bounded however wide the row.
+		p.tableCell()
 		return true
 	case p.l.IsDone():
 		p.done = true
@@ -345,7 +370,18 @@ func (p *Parser) parseLine() {
 		p.contentEnd = trim
 		return
 	}
+	// An open table takes any line nothing above claimed as its next row, as
+	// long as the line holds a cell. Every other line has closed it by now:
+	// matchOpen never matches a table, so closeTo(matched) ends it.
+	if top := len(p.stack) - 1; matched == top && p.stack[top].node.Kind == KindTable && p.lineHasCells() {
+		p.openRow()
+		return
+	}
 	p.closeForSibling(matched)
+	if cols, ok := p.atTable(len(p.stack)); ok {
+		p.openTable(contentStart, cols)
+		return
+	}
 	if !p.push(frame{node: Node{Kind: KindParagraph, Start: contentStart, End: contentStart}}) {
 		return
 	}
@@ -383,6 +419,9 @@ func (p *Parser) continuesLeaf(depth int) bool {
 	}
 	if _, _, _, ok := p.atFence(); ok {
 		return false
+	}
+	if _, ok := p.atTable(depth); ok {
+		return false // The line heads a table, which ends the paragraph above it.
 	}
 	return true
 }
@@ -788,6 +827,199 @@ func (p *Parser) atCloseFence(ch byte, n int32) (end Pos, ok bool) {
 		return 0, false
 	}
 	return end, true
+}
+
+// --- tables ---
+//
+// A table is a container of rows and a row a container of cells, which are
+// leaves. The header row is told apart from a paragraph only by the delimiter
+// row under it, so atTable reads two lines ahead and rewinds. The delimiter row
+// itself is never emitted; its alignments ride on the cells instead.
+
+// atTable reports whether the line at the cursor heads a table: the next line
+// must continue the same depth containers and be a delimiter row with as many
+// cells. Records the column alignments and restores the cursor either way.
+func (p *Parser) atTable(depth int) (cols int32, ok bool) {
+	if !p.l.nextLineHas('-') {
+		return 0, false // Every delimiter cell holds a dash.
+	}
+	m := p.mark()
+	cols = p.rowCells()
+	p.l.SkipLine()
+	ok = cols > 0 && !p.l.IsDone() && p.matchOpen() == depth && p.delimRow(cols)
+	p.reset(m)
+	return cols, ok
+}
+
+// delimRow matches a delimiter row of exactly want cells, each ":?-+:?",
+// recording their alignments. A row with neither pipe nor colon is dashes
+// alone, which CommonMark reads as a setext underline or a thematic break.
+func (p *Parser) delimRow(want int32) bool {
+	codeStart, blank := p.scanIndent(int32(p.l.Col()))
+	if blank || codeStart >= 0 || want > p.maxTableCols() {
+		return false
+	}
+	if _, _, ok := p.atBullet(); ok {
+		return false // "- | -" opens a list item.
+	}
+	marked := p.l.PeekRune() == '|'
+	if marked {
+		p.l.advance()
+	}
+	for n := int32(0); ; n++ {
+		p.skipAll()
+		a, dashes := uint8(0), false
+		if p.l.PeekRune() == ':' {
+			a |= AlignLeft
+			p.l.advance()
+		}
+		for p.l.PeekRune() == '-' {
+			dashes = true
+			p.l.advance()
+		}
+		if p.l.PeekRune() == ':' {
+			a |= AlignRight
+			p.l.advance()
+		}
+		if !dashes || n >= want {
+			return false
+		}
+		if int(n) < len(p.aligns) {
+			p.aligns[n] = a
+		} else {
+			p.aligns = append(p.aligns, a)
+		}
+		marked = marked || a != 0
+		p.skipAll()
+		piped := p.l.PeekRune() == '|'
+		if piped {
+			p.l.advance()
+			marked = true
+			p.skipAll()
+		}
+		if isLineEndRune(p.l.PeekRune()) {
+			return marked && n+1 == want
+		}
+		if !piped {
+			return false
+		}
+	}
+}
+
+// readCell consumes one cell: everything up to the next '|' that no backslash
+// precedes, the pipe included, or up to the line ending, which it leaves. end
+// is past the cell's last non-space byte, or the cursor it started from.
+//
+// This is the only place a row is split, so the header's cell count and the
+// cells emitted for it cannot disagree. Pipes split cells inside code spans and
+// links too, as GFM requires; the inline scan is bounded to each cell.
+func (p *Parser) readCell() (end Pos, piped bool) {
+	end = p.l.Pos()
+	prev := rune(0)
+	for {
+		r := p.l.PeekRune()
+		if isLineEndRune(r) {
+			return end, false
+		}
+		p.l.advance()
+		if r == '|' && prev != '\\' {
+			return end, true
+		}
+		if !isIndentRune(r) {
+			end = p.l.Pos()
+		}
+		prev = r
+	}
+}
+
+// rowCells counts the cells on the rest of the line, consuming them. A leading
+// pipe opens the row rather than a cell, and trailing space after the last pipe
+// is no cell either: "|" holds none, "||" one, "a |" one. Counting stops past
+// MaxTableColumns, which no table may exceed anyway.
+func (p *Parser) rowCells() (n int32) {
+	if p.l.PeekRune() == '|' {
+		p.l.advance()
+	}
+	for n <= p.maxTableCols() {
+		p.skipAll()
+		start := p.l.Pos()
+		end, piped := p.readCell()
+		if !piped && end == start {
+			break
+		}
+		n++
+		if !piped {
+			break
+		}
+	}
+	return n
+}
+
+// lineHasCells reports whether the rest of the line holds a cell, without
+// consuming it. A line of "|" alone holds none and so ends a table.
+func (p *Parser) lineHasCells() bool {
+	m := p.mark()
+	n := p.rowCells()
+	p.reset(m)
+	return n > 0
+}
+
+func (p *Parser) openTable(start Pos, cols int32) {
+	if p.push(frame{node: Node{Kind: KindTable, Attr: cols, Start: start, End: start}}) {
+		p.openRow()
+	}
+}
+
+// openRow opens the open table's next row at the cursor. Its leading pipe, if
+// any, belongs to the row and not to the first cell.
+func (p *Parser) openRow() {
+	t := &p.stack[len(p.stack)-1]
+	n := Node{Kind: KindTableRow, Attr: t.count, Start: p.l.Pos(), End: p.l.Pos()}
+	t.count++ // Before push, which may move the stack.
+	if p.push(frame{node: n}) && p.l.PeekRune() == '|' {
+		p.l.advance()
+	}
+}
+
+// tableCell opens the open row's next cell and scans its content, or closes the
+// row once its line or its table's columns run out.
+func (p *Parser) tableCell() {
+	top := len(p.stack) - 1
+	row := &p.stack[top]
+	p.skipAll()
+	start := p.l.Pos()
+	m := p.mark()
+	end, piped := p.readCell()
+	if row.count >= p.stack[top-1].node.Attr || (!piped && end == start) {
+		p.reset(m)
+		p.closeRow()
+		return
+	}
+	next := p.mark()
+	align := p.aligns[row.count]
+	row.count++ // Before push, which may move the stack.
+	p.reset(m)
+	if !p.push(frame{node: Node{Kind: KindTableCell, Attr: int32(align), Start: start, End: start}}) {
+		return
+	}
+	p.beginInline(start, end, end)
+	// Pass two reads no bytes, so the cursor can move on to the next cell now.
+	p.reset(next)
+}
+
+// closeRow closes the open row over the rest of its line, which takes any cells
+// past the table's width with it. The header row also takes the delimiter row
+// beneath it, which atTable already vetted.
+func (p *Parser) closeRow() {
+	top := len(p.stack) - 1
+	header := p.stack[top].node.Attr == 0
+	trim, _, _ := p.readLine()
+	p.contentEnd = trim
+	p.closeTo(top, trim)
+	if header {
+		p.matchOpen()
+		p.contentEnd, _, _ = p.readLine()
+	}
 }
 
 // --- cursor helpers ---

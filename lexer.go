@@ -1,6 +1,7 @@
 package ohimark
 
 import (
+	"bytes"
 	"io"
 	"unicode/utf8"
 
@@ -156,7 +157,7 @@ func (l *Lexer) Next() (tok Token, start, end Pos) {
 		if end, ok := l.readEntity(); ok {
 			return tok, start, end
 		}
-	case TokPlus, TokBang, TokLT, TokBracketL, TokBracketR, TokParenL, TokParenR, TokDot:
+	case TokPlus, TokBang, TokLT, TokBracketL, TokBracketR, TokParenL, TokParenR, TokDot, TokPipe:
 		l.advance()
 		return tok, start, Pos(l.pos)
 	default:
@@ -225,6 +226,31 @@ func (l *Lexer) Resident(start, end Pos) ([]byte, bool) {
 	return buf[i:j], true
 }
 
+// nextLineHas reports whether the line after the current one holds byte c,
+// judged from the resident bytes alone, and true when they do not reach that
+// line's end. It is a veto: one byte search that can spare a probe the cost of
+// reading two lines through the cursor and rewinding.
+func (l *Lexer) nextLineHas(c byte) bool {
+	buf, base := l.w.Buffer()
+	if l.pos < base || l.pos > base+int64(len(buf)) {
+		return true
+	}
+	rest := buf[l.pos-base:]
+	i := bytes.IndexAny(rest, "\r\n")
+	if i < 0 {
+		return true
+	}
+	if rest[i] == '\r' && i+1 < len(rest) && rest[i+1] == '\n' {
+		i++
+	}
+	next := rest[i+1:]
+	j := bytes.IndexAny(next, "\r\n")
+	if j < 0 {
+		return true
+	}
+	return bytes.IndexByte(next[:j], c) >= 0
+}
+
 // fill tops the peek buffer back up.
 func (l *Lexer) fill() {
 	for !l.eof && l.n < peeklen {
@@ -235,6 +261,11 @@ func (l *Lexer) fill() {
 				l.err = err
 			}
 			return
+		}
+		if r == 0 {
+			// CommonMark reads NUL as U+FFFD. It also keeps 0 meaning end of
+			// input and nothing else, which every line-end probe relies on.
+			r = utf8.RuneError
 		}
 		l.peek[l.n] = r
 		l.size[l.n] = int8(size)
